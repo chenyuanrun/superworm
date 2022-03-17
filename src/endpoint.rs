@@ -1,4 +1,4 @@
-use crate::msg::{ReadCtx, WriteCtx};
+use crate::msg::{Msg, MsgCtx};
 use std::net::SocketAddr;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -15,20 +15,14 @@ pub async fn endpoint(addr: SocketAddr, cli_addr: SocketAddr) {
 }
 
 struct Endpoint {
-    read_ctx: ReadCtx,
-    write_ctx: WriteCtx,
+    msg_ctx: MsgCtx<Msg>,
 }
 
 impl Endpoint {
     fn new() -> Self {
         Endpoint {
-            read_ctx: ReadCtx::new(),
-            write_ctx: WriteCtx::new(),
+            msg_ctx: MsgCtx::new(),
         }
-    }
-
-    fn should_write(&self) -> bool {
-        self.write_ctx.written_size.is_some() || self.write_ctx.msgs.len() != 0
     }
 
     fn handle_msgs(&self) {
@@ -52,7 +46,7 @@ async fn route(addr: SocketAddr, ctl_rx: mpsc::Receiver<Ctl>) {
         tokio::select! {
             // Read from Hole.
             r = readhalf.readable() => {
-                if let Err(e) = ep.read_ctx.handle_read(&mut readhalf) {
+                if let Err(e) = ep.msg_ctx.handle_read(&mut readhalf) {
                     println!("Failed to handle read: {}", e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
@@ -62,8 +56,8 @@ async fn route(addr: SocketAddr, ctl_rx: mpsc::Receiver<Ctl>) {
                 ep.handle_msgs();
             }
             // Write to Hole.
-            r = writehalf.writable(), if ep.should_write() => {
-                if let Err(e) = ep.write_ctx.handle_write(&mut writehalf) {
+            r = writehalf.writable(), if ep.msg_ctx.need_to_write() => {
+                if let Err(e) = ep.msg_ctx.handle_write(&mut writehalf) {
                     println!("Failed to handle write: {}", e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();

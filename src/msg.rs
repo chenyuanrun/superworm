@@ -1,3 +1,4 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::convert::TryInto;
@@ -9,21 +10,50 @@ use tokio::net::tcp::OwnedWriteHalf;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Msg {}
 
-pub struct ReadCtx {
-    pub read_size: Option<usize>,
-    pub read_buf: Vec<u8>,
-    pub msgs: VecDeque<Msg>,
+pub struct MsgCtx<M> {
+    read_size: Option<usize>,
+    read_buf: Vec<u8>,
+    msgs_from_read: VecDeque<M>,
+
+    written_size: Option<usize>,
+    write_buf: Vec<u8>,
+    msgs_to_write: VecDeque<M>,
 }
 
-impl ReadCtx {
+impl<M> MsgCtx<M> {
     pub fn new() -> Self {
-        ReadCtx {
+        MsgCtx {
             read_size: None,
             read_buf: Vec::with_capacity(2048),
-            msgs: VecDeque::new(),
+            msgs_from_read: VecDeque::new(),
+
+            written_size: None,
+            write_buf: Vec::with_capacity(2048),
+            msgs_to_write: VecDeque::new(),
         }
     }
 
+    pub fn have_rx_msg(&self) -> bool {
+        !self.msgs_from_read.is_empty()
+    }
+
+    pub fn pop_rx_msg(&mut self) -> Option<M> {
+        self.msgs_from_read.pop_front()
+    }
+
+    pub fn need_to_write(&self) -> bool {
+        !self.msgs_to_write.is_empty() || self.written_size.is_some()
+    }
+
+    pub fn queue_tx_msg(&mut self, msg: M) {
+        self.msgs_to_write.push_back(msg);
+    }
+}
+
+impl<M> MsgCtx<M>
+where
+    M: DeserializeOwned,
+{
     pub fn handle_read(&mut self, readhalf: &mut OwnedReadHalf) -> Result<(), std::io::Error> {
         if self.read_size.is_none() {
             let len = self.read_buf.len();
@@ -58,9 +88,9 @@ impl ReadCtx {
         }
 
         // Deserialize.
-        let res = match bincode::deserialize::<Msg>(&self.read_buf[..]) {
+        let res = match bincode::deserialize::<M>(&self.read_buf[..]) {
             Ok(msg) => {
-                self.msgs.push_back(msg);
+                self.msgs_from_read.push_back(msg);
                 Ok(())
             }
             Err(e) => {
@@ -74,25 +104,14 @@ impl ReadCtx {
     }
 }
 
-pub struct WriteCtx {
-    pub written_size: Option<usize>,
-    pub write_buf: Vec<u8>,
-    pub msgs: VecDeque<Msg>,
-}
-
-impl WriteCtx {
-    pub fn new() -> Self {
-        WriteCtx {
-            written_size: None,
-            write_buf: Vec::with_capacity(2048),
-            msgs: VecDeque::new(),
-        }
-    }
-
+impl<M> MsgCtx<M>
+where
+    M: Serialize,
+{
     pub fn handle_write(&mut self, writehalf: &mut OwnedWriteHalf) -> Result<(), std::io::Error> {
         if self.written_size.is_none() {
             // Serialize first.
-            let msg = match self.msgs.pop_front() {
+            let msg = match self.msgs_to_write.pop_front() {
                 Some(msg) => msg,
                 None => return Ok(()),
             };
@@ -103,7 +122,7 @@ impl WriteCtx {
             if let Err(e) = bincode::serialize_into(&mut cursor, &msg) {
                 println!("Failed to serialise: {}", e);
                 drop(cursor);
-                self.msgs.push_front(msg);
+                self.msgs_to_write.push_front(msg);
                 return Err(std::io::Error::from_raw_os_error(22));
             }
             drop(cursor);
