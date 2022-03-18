@@ -24,7 +24,7 @@ pub async fn hole(eps: Vec<SocketAddr>) {
 }
 
 struct Hole {
-    msg_ctx: MsgCtx<Msg>,
+    msg_ctx: MsgCtx<Msg, Msg>,
 }
 
 impl Hole {

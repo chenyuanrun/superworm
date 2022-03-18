@@ -10,17 +10,17 @@ use tokio::net::tcp::OwnedWriteHalf;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Msg {}
 
-pub struct MsgCtx<M> {
+pub struct MsgCtx<RM, WM> {
     read_size: Option<usize>,
     read_buf: Vec<u8>,
-    msgs_from_read: VecDeque<M>,
+    msgs_from_read: VecDeque<RM>,
 
     written_size: Option<usize>,
     write_buf: Vec<u8>,
-    msgs_to_write: VecDeque<M>,
+    msgs_to_write: VecDeque<WM>,
 }
 
-impl<M> MsgCtx<M> {
+impl<RM, WM> MsgCtx<RM, WM> {
     pub fn new() -> Self {
         MsgCtx {
             read_size: None,
@@ -37,7 +37,7 @@ impl<M> MsgCtx<M> {
         !self.msgs_from_read.is_empty()
     }
 
-    pub fn pop_rx_msg(&mut self) -> Option<M> {
+    pub fn pop_rx_msg(&mut self) -> Option<RM> {
         self.msgs_from_read.pop_front()
     }
 
@@ -45,14 +45,14 @@ impl<M> MsgCtx<M> {
         !self.msgs_to_write.is_empty() || self.written_size.is_some()
     }
 
-    pub fn queue_tx_msg(&mut self, msg: M) {
+    pub fn queue_tx_msg(&mut self, msg: WM) {
         self.msgs_to_write.push_back(msg);
     }
 }
 
-impl<M> MsgCtx<M>
+impl<RM, WM> MsgCtx<RM, WM>
 where
-    M: DeserializeOwned,
+    RM: DeserializeOwned,
 {
     pub fn handle_read(&mut self, readhalf: &mut OwnedReadHalf) -> Result<(), std::io::Error> {
         if self.read_size.is_none() {
@@ -88,7 +88,7 @@ where
         }
 
         // Deserialize.
-        let res = match bincode::deserialize::<M>(&self.read_buf[..]) {
+        let res = match bincode::deserialize::<RM>(&self.read_buf[..]) {
             Ok(msg) => {
                 self.msgs_from_read.push_back(msg);
                 Ok(())
@@ -104,9 +104,9 @@ where
     }
 }
 
-impl<M> MsgCtx<M>
+impl<RM, WM> MsgCtx<RM, WM>
 where
-    M: Serialize,
+    WM: Serialize,
 {
     pub fn handle_write(&mut self, writehalf: &mut OwnedWriteHalf) -> Result<(), std::io::Error> {
         if self.written_size.is_none() {
