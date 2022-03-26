@@ -7,7 +7,7 @@ use tokio::time::{sleep, Duration};
 
 pub async fn hole(eps: Vec<SocketAddr>) {
     if eps.len() != 2 {
-        println!("Expect 2 ep, found {}", eps.len());
+        eprintln!("Expect 2 ep, found {}", eps.len());
         return;
     }
     let (tx1, rx1) = mpsc::channel(1024);
@@ -18,7 +18,7 @@ pub async fn hole(eps: Vec<SocketAddr>) {
 
     loop {
         sleep(Duration::from_secs(1)).await;
-        println!("tick");
+        eprintln!("tick");
         // TODO: exit gracefully.
     }
 }
@@ -55,7 +55,7 @@ async fn route(ep: SocketAddr, tx: mpsc::Sender<Msg>, mut rx: mpsc::Receiver<Msg
             // Read from socket.
             r = readhalf.readable() => {
                 if let Err(e) = hole.msg_ctx.handle_read(&mut readhalf) {
-                    println!{"Failed to handle read from {}: {}", ep, e};
+                    eprintln!{"Failed to handle read from {}: {}", ep, e};
                     let (rh, wh) = connect(ep).await.into_split();
                     readhalf = rh;
                     writehalf = wh;
@@ -64,7 +64,7 @@ async fn route(ep: SocketAddr, tx: mpsc::Sender<Msg>, mut rx: mpsc::Receiver<Msg
             // Write to socket.
             r = writehalf.writable(), if hole.msg_ctx.need_to_write() => {
                 if let Err(e) = hole.msg_ctx.handle_write(&mut writehalf) {
-                    println!{"Failed to handle write from {}: {}", ep, e};
+                    eprintln!{"Failed to handle write from {}: {}", ep, e};
                     let (rh, wh) = connect(ep).await.into_split();
                     readhalf = rh;
                     writehalf = wh;
@@ -103,7 +103,7 @@ async fn connect(addr: SocketAddr) -> TcpStream {
                 return conn;
             }
             Err(e) => {
-                println!("Failed to connect to {}: {}", addr, e);
+                eprintln!("Failed to connect to {}: {}", addr, e);
                 // Try again in a second.
                 sleep(Duration::from_secs(1)).await;
             }

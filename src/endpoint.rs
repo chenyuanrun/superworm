@@ -1,14 +1,27 @@
+use crate::cli::Action;
 use crate::msg::{Msg, MsgCtx};
-use std::net::SocketAddr;
-use tokio::{net::{TcpListener, TcpStream}, sync::mpsc::{self, Sender}};
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::net::SocketAddr;
 use tokio::sync::oneshot;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc::{self, Sender},
+};
 
 #[derive(Serialize, Deserialize)]
-enum Ctl {}
+pub enum Ctl {
+    Act(Action),
+}
 
 #[derive(Serialize, Deserialize)]
-enum CtlRsp {}
+pub enum CtlRsp {}
+
+impl Display for CtlRsp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
+}
 
 type CtlChanMsg = (Ctl, oneshot::Sender<CtlRsp>);
 
@@ -35,7 +48,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
             // Read from cli
             _ = readhalf.readable() => {
                 if let Err(e) = msg_ctx.handle_read(&mut readhalf) {
-                    println!("Failed to handle read: {}", e);
+                    eprintln!("Failed to handle read: {}", e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -63,7 +76,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
             // Write to cli
             _ = writehalf.writable(), if msg_ctx.need_to_write() => {
                 if let Err(e) = msg_ctx.handle_write(&mut writehalf) {
-                    println!("Failed to handle write: {}", e);
+                    eprintln!("Failed to handle write: {}", e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -112,7 +125,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
             // Read from Hole.
             r = readhalf.readable() => {
                 if let Err(e) = ep.msg_ctx.handle_read(&mut readhalf) {
-                    println!("Failed to handle read: {}", e);
+                    eprintln!("Failed to handle read: {}", e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -123,7 +136,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
             // Write to Hole.
             r = writehalf.writable(), if ep.msg_ctx.need_to_write() => {
                 if let Err(e) = ep.msg_ctx.handle_write(&mut writehalf) {
-                    println!("Failed to handle write: {}", e);
+                    eprintln!("Failed to handle write: {}", e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -136,7 +149,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
                     // Handle ctl and then response.
                     ep.handle_ctl(ctl, oneshot_tx).await;
                 } else {
-                    println!("ctl_rx closed");
+                    eprintln!("ctl_rx closed");
                     ctl_rx_closed = true;
                 }
             }

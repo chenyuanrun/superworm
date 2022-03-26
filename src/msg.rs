@@ -68,7 +68,7 @@ where
         }
         let read_size = self.read_size.unwrap();
         if read_size > 1024 * 1024 * 100 {
-            println!("read_size is too large: {}", read_size);
+            eprintln!("read_size is too large: {}", read_size);
             self.read_size = None;
             self.read_buf.clear();
             return Err(std::io::Error::from_raw_os_error(22));
@@ -94,13 +94,25 @@ where
                 Ok(())
             }
             Err(e) => {
-                println!("Failed to deserialize: {}", e);
+                eprintln!("Failed to deserialize: {}", e);
                 Err(std::io::Error::from_raw_os_error(22))
             }
         };
         self.read_size = None;
         self.read_buf.clear();
         res
+    }
+
+    pub async fn read(&mut self, readhalf: &mut OwnedReadHalf) -> Result<RM, std::io::Error> {
+        if let Some(rmsg) = self.pop_rx_msg() {
+            return Ok(rmsg);
+        }
+        while !self.have_rx_msg() {
+            let _ = readhalf.readable().await;
+            self.handle_read(readhalf)?;
+        }
+        // There must be msg received here.
+        Ok(self.pop_rx_msg().unwrap())
     }
 }
 
@@ -120,7 +132,7 @@ where
             // Reserve space for size of msg.
             cursor.set_position(size_of::<u64>() as u64);
             if let Err(e) = bincode::serialize_into(&mut cursor, &msg) {
-                println!("Failed to serialise: {}", e);
+                eprintln!("Failed to serialise: {}", e);
                 drop(cursor);
                 self.msgs_to_write.push_front(msg);
                 return Err(std::io::Error::from_raw_os_error(22));
@@ -137,7 +149,7 @@ where
         written_size += match writehalf.try_write(&self.write_buf[written_size..]) {
             Ok(r) => r,
             Err(e) => {
-                println!("Failed to write: {}", e);
+                eprintln!("Failed to write: {}", e);
                 self.written_size = None;
                 self.write_buf.clear();
                 return Err(e);
@@ -147,6 +159,19 @@ where
             // All data is written.
             self.written_size = None;
             self.write_buf.clear();
+        }
+        Ok(())
+    }
+
+    pub async fn write(
+        &mut self,
+        writehalf: &mut OwnedWriteHalf,
+        wmsg: WM,
+    ) -> Result<(), std::io::Error> {
+        self.queue_tx_msg(wmsg);
+        while self.need_to_write() {
+            let _ = writehalf.writable().await;
+            self.handle_write(writehalf)?;
         }
         Ok(())
     }
