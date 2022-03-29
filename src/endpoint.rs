@@ -1,8 +1,11 @@
 use crate::cli::Action;
-use crate::msg::{Msg, MsgCtx};
+use crate::msg::{AddrPair, Msg, MsgCtx, MsgType};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
+use std::iter::Scan;
 use std::net::SocketAddr;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -15,11 +18,24 @@ pub enum Ctl {
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum CtlRsp {}
+pub enum CtlRsp {
+    Msg(i32, String),
+    MapLs(Vec<(SocketAddr, SocketAddr)>),
+}
 
 impl Display for CtlRsp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "")
+        match self {
+            CtlRsp::Msg(_, msg) => {
+                write!(f, "msg: {}", msg)
+            }
+            CtlRsp::MapLs(l) => {
+                for (lst_addr, dst_addr) in l {
+                    write!(f, "{} => {}", lst_addr, dst_addr)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -89,12 +105,17 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
 
 struct Endpoint {
     msg_ctx: MsgCtx<Msg, Msg>,
+    port_mappers: HashMap<(SocketAddr, SocketAddr), Sender<Msg>>,
+    // Mapper -> router
+    router_tx: mpsc::Sender<Msg>,
 }
 
 impl Endpoint {
-    fn new() -> Self {
+    fn new(router_tx: mpsc::Sender<Msg>) -> Self {
         Endpoint {
             msg_ctx: MsgCtx::new(),
+            port_mappers: HashMap::new(),
+            router_tx,
         }
     }
 
@@ -103,13 +124,55 @@ impl Endpoint {
     }
 
     async fn handle_ctl(&mut self, ctl: Ctl, oneshot_tx: oneshot::Sender<CtlRsp>) {
-        // TODO
+        match ctl {
+            Ctl::Act(act) => self.handle_action(act, oneshot_tx).await,
+        };
+    }
+
+    async fn handle_action(&mut self, act: Action, oneshot_tx: oneshot::Sender<CtlRsp>) {
+        match act {
+            Action::MapAdd { lst_addr, dst_addr } => {
+                let key = (lst_addr.clone(), dst_addr.clone());
+                if self.port_mappers.contains_key(&key) {
+                    let _ = oneshot_tx.send(CtlRsp::Msg(
+                        1,
+                        format!("map {}<=>{} exist", lst_addr, dst_addr),
+                    ));
+                    return;
+                }
+                let (mapper_tx, mapper_rx) = mpsc::channel(1024);
+                let mapper = PortMapper {
+                    lst_addr: lst_addr.clone(),
+                    dst_addr: dst_addr.clone(),
+                    mapper_rx,
+                    router_tx: self.router_tx.clone(),
+                    ports: HashMap::new(),
+                };
+                // Start port mapper.
+                tokio::spawn(mapper.run());
+                self.port_mappers.insert(key, mapper_tx);
+            }
+            Action::MapRm { lst_addr, dst_addr } => {
+                // TODO: Stop mapper.
+                // Remove mapper from Endpoint.
+                self.port_mappers.remove(&(lst_addr, dst_addr));
+            }
+            Action::MapLs => {
+                let mut mapls = Vec::new();
+                for (lst_addr, dst_addr) in self.port_mappers.keys() {
+                    mapls.push((lst_addr.clone(), dst_addr.clone()));
+                }
+                let _ = oneshot_tx.send(CtlRsp::MapLs(mapls));
+            }
+        };
     }
 }
 
 async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
-    let mut ep = Endpoint::new();
+    let (mapper_tx, mut mapper_rx) = mpsc::channel(1024);
+    let mut ep = Endpoint::new(mapper_tx);
     let mut ctl_rx_closed = false;
+    let mut mapper_rx_closed = false;
     // Listen to addr.
     let mut listener = match TcpListener::bind(&addr).await {
         Ok(r) => r,
@@ -153,6 +216,16 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
                     ctl_rx_closed = true;
                 }
             }
+            // Receive from mapper
+            r = mapper_rx.recv(), if !mapper_rx_closed => {
+                if let Some(msg) = r {
+                    // This msg should send to hole
+                    ep.msg_ctx.queue_tx_msg(msg);
+                } else {
+                    eprintln!("mapper_rx closed");
+                    mapper_rx_closed = true;
+                }
+            }
         }
     }
 }
@@ -162,6 +235,200 @@ async fn accept(listener: &mut TcpListener) -> (TcpStream, SocketAddr) {
         Ok(conn) => conn,
         Err(e) => {
             panic!("Failed to accept: {}", e);
+        }
+    }
+}
+
+struct PortMapper {
+    lst_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    // Router -> mapper
+    mapper_rx: Receiver<Msg>,
+    // Mapper/Port -> router
+    router_tx: Sender<Msg>,
+    // key: (lst_addr, dst_addr)
+    ports: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Msg>>,
+}
+
+impl PortMapper {
+    async fn run(mut self) {
+        // Listen lst_addr
+        let lst = match TcpListener::bind(&self.lst_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to listen on {}: {}", self.lst_addr, e);
+                return;
+            }
+        };
+        // Wait for connection and messages.
+        tokio::select! {
+            // New connection.
+            r = lst.accept() => {
+                let (conn, addr) = match r {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // If we failed to listen, this mapper is dead.
+                        eprintln!("Failed to accept {}: {}", self.lst_addr, e);
+                        // TODO: Maybe do some clean.
+                        return;
+                    }
+                };
+                let key = (self.lst_addr.clone(), addr.clone());
+                // PortMapper -> Port
+                let (port_tx, port_rx) = mpsc::channel(1024);
+                self.ports.insert(key, port_tx);
+                tokio::spawn(port(port_rx, self.router_tx.clone(), conn, self.lst_addr, addr, self.dst_addr));
+            }
+            // New msg.
+            r = self.mapper_rx.recv() => {
+                let msg = if let Some(msg) = r {
+                    msg
+                } else {
+                    // Maybe this mapper is dead.
+                    eprintln!("Failed to recv msg for {}", self.lst_addr);
+                    // TODO: Do some clean.
+                    return;
+                };
+                // Now process msg...
+                self.process_msg(msg).await;
+            }
+        }
+    }
+
+    async fn process_msg(&mut self, msg: Msg) {
+        let key = (msg.addr.lst_addr.clone(), msg.addr.dst_addr.clone());
+        if let Some(tx) = self.ports.get_mut(&key) {
+            let lst_addr = msg.addr.lst_addr.clone();
+            if let Err(e) = tx.send(msg).await {
+                eprintln!("Failed to send msg to {}: {}", lst_addr, e);
+                // This port is dead.
+                self.ports.remove(&key);
+            }
+        } else {
+            // No port match for this msg, just drop it.
+            eprintln!(
+                "No port match for msg, local_addr: {}, lst_addr: {}, remap_addr: {}, dst_addr: {}",
+                msg.addr.local_addr, msg.addr.lst_addr, msg.addr.remap_addr, msg.addr.dst_addr
+            );
+        }
+    }
+}
+
+async fn port(
+    mut rx: mpsc::Receiver<Msg>,
+    tx: mpsc::Sender<Msg>,
+    conn: TcpStream,
+    lst_addr: SocketAddr,
+    local_addr: SocketAddr,
+    dst_addr: SocketAddr,
+) {
+    // TODO
+    let mut data_to_write: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut writing_buf: Option<Vec<u8>> = None;
+    let mut written_bytes: usize = 0;
+    let mut read_buf: Vec<u8> = Vec::new();
+    let mut remap_addr: Option<SocketAddr> = None;
+    let mut can_read = false;
+
+    let (rh, wh) = conn.into_split();
+
+    // Send a msg to the peer.
+    if let Err(e) = tx
+        .send(Msg {
+            addr: AddrPair {
+                local_addr: local_addr.clone(),
+                lst_addr: lst_addr.clone(),
+                remap_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                dst_addr: dst_addr.clone(),
+            },
+            typ: MsgType::MapConnecting,
+        })
+        .await
+    {
+        eprintln!("Failed to send MapConnecting to peer: {}", e);
+        // This port is dead.
+        return;
+    };
+
+    tokio::select! {
+        // Read from local addr.
+        _ = rh.readable(), if can_read => {
+            match rh.try_read_buf(&mut read_buf) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to read from {}: {}", local_addr, e);
+                    // This port is dead.
+                    return;
+                }
+            };
+            let msg = Msg {
+                addr: AddrPair {
+                    local_addr: local_addr.clone(),
+                    lst_addr: lst_addr.clone(),
+                    remap_addr: remap_addr.as_ref().unwrap().clone(),
+                    dst_addr: dst_addr.clone(),
+                },
+                typ: MsgType::MapData(read_buf),
+            };
+            // Send msg to router.
+            if let Err(e) = tx.send(msg).await {
+                eprintln!("Failed to send msg to route for {}: {}", lst_addr, e);
+                // This port is dead.
+                return;
+            }
+            // Create a new read buffer.
+            read_buf = Vec::new();
+        }
+        // Write to local addr.
+        _ = wh.writable(), if writing_buf.is_some() || data_to_write.len() != 0 => {
+            if writing_buf.is_some() {
+                // Continue to write.
+                let writing_buf_ref = writing_buf.as_ref().unwrap();
+                let len = writing_buf_ref.len();
+                let s = match wh.try_write(&writing_buf_ref[written_bytes..len]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Failed to write to {}: {}", local_addr, e);
+                        // This port is dead.
+                        return;
+                    }
+                };
+                written_bytes += s;
+                assert!(written_bytes <= len);
+                if written_bytes == len {
+                    // This segment of data is all written.
+                    writing_buf = data_to_write.pop_front();
+                    written_bytes = 0;
+                }
+            } else {
+                // writing_buf will be written next time.
+                writing_buf = data_to_write.pop_front();
+            }
+        }
+        // Receive msg from router
+        m = rx.recv() => {
+            let Msg {addr, typ} = if let Some(m) = m {
+                m
+            } else {
+                eprintln!("Failed to receive msg from router");
+                // This port is dead.
+                return;
+            };
+            // Now process msg.
+            match typ {
+                MsgType::MapData(data) => {
+                    data_to_write.push_back(data);
+                },
+                MsgType::MapConnected => {
+                    // We can read data now.
+                    remap_addr = Some(addr.remap_addr);
+                    can_read = true;
+                },
+                _ => {
+                    // We can not handle this msg.
+                    eprintln!("Unknown msg type");
+                },
+            }
         }
     }
 }

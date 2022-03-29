@@ -4,12 +4,32 @@ use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::io::Cursor;
 use std::mem::size_of;
+use std::net::SocketAddr;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum Msg {}
+pub struct Msg {
+    pub addr: AddrPair,
+    pub typ: MsgType,
+}
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum MsgType {
+    MapData(Vec<u8>),
+    MapConnecting,
+    MapConnected,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AddrPair {
+    pub local_addr: SocketAddr,
+    pub lst_addr: SocketAddr,
+    pub remap_addr: SocketAddr,
+    pub dst_addr: SocketAddr,
+}
+
+// TODO: Should resize vec before read.
 pub struct MsgCtx<RM, WM> {
     read_size: Option<usize>,
     read_buf: Vec<u8>,
