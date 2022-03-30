@@ -1,10 +1,11 @@
 use crate::cli::Action;
-use crate::msg::{AddrPair, Msg, MsgCtx, MsgType};
+use crate::msg::{AddrPair, Msg, MsgCtx, MsgDirection, MsgType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::iter::Scan;
 use std::net::SocketAddr;
+use tokio::fs::write;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::{
@@ -105,7 +106,10 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
 
 struct Endpoint {
     msg_ctx: MsgCtx<Msg, Msg>,
+    // lst ports, key: (lst_addr, dst_addr)
     port_mappers: HashMap<(SocketAddr, SocketAddr), Sender<Msg>>,
+    // dst ports, key: (lst_addr, dst_addr, local_addr)
+    dst_ports: HashMap<(SocketAddr, SocketAddr, SocketAddr), Sender<Msg>>,
     // Mapper -> router
     router_tx: mpsc::Sender<Msg>,
 }
@@ -115,12 +119,76 @@ impl Endpoint {
         Endpoint {
             msg_ctx: MsgCtx::new(),
             port_mappers: HashMap::new(),
+            dst_ports: HashMap::new(),
             router_tx,
         }
     }
 
     async fn handle_msgs(&mut self) {
-        // TODO
+        loop {
+            let msg = self.msg_ctx.pop_rx_msg();
+            if msg.is_none() {
+                break;
+            }
+            let Msg { addr, dir, typ } = msg.unwrap();
+            match typ {
+                MsgType::MapConnecting => {
+                    // Try to connect to dst_addr.
+                    let key = (
+                        addr.lst_addr.clone(),
+                        addr.dst_addr.clone(),
+                        addr.local_addr.clone(),
+                    );
+                    let (tx, rx) = mpsc::channel(1024);
+                    tokio::spawn(dst_port(addr, self.router_tx.clone(), rx));
+                    let _ = self.dst_ports.insert(key, tx);
+                }
+                typ => {
+                    match dir {
+                        MsgDirection::L2D => {
+                            let key = (addr.lst_addr.clone(), addr.dst_addr.clone());
+                            if let Some(tx) = self.port_mappers.get(&key) {
+                                if let Err(_) = tx
+                                    .send(Msg {
+                                        addr,
+                                        dir: MsgDirection::L2D,
+                                        typ,
+                                    })
+                                    .await
+                                {
+                                    // This map is dead.
+                                    self.port_mappers.remove(&key);
+                                }
+                            } else {
+                                // No match for this msg.
+                                eprintln!("No match for {}->{}", key.0, key.1);
+                            }
+                        }
+                        MsgDirection::D2L => {
+                            let key = (
+                                addr.lst_addr.clone(),
+                                addr.dst_addr.clone(),
+                                addr.local_addr.clone(),
+                            );
+                            if let Some(tx) = self.dst_ports.get(&key) {
+                                if let Err(_) = tx
+                                    .send(Msg {
+                                        addr,
+                                        dir: MsgDirection::D2L,
+                                        typ,
+                                    })
+                                    .await
+                                {
+                                    // This port is dead.
+                                    self.dst_ports.remove(&key);
+                                }
+                            }
+                        }
+                    }
+                    // Rout msg to lst port
+                }
+            }
+        }
     }
 
     async fn handle_ctl(&mut self, ctl: Ctl, oneshot_tx: oneshot::Sender<CtlRsp>) {
@@ -165,6 +233,117 @@ impl Endpoint {
                 let _ = oneshot_tx.send(CtlRsp::MapLs(mapls));
             }
         };
+    }
+}
+
+async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Receiver<Msg>) {
+    // TODO
+    let mut data_to_write: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut data_writing: Option<Vec<u8>> = None;
+    let mut written_bytes: usize = 0;
+    let dir = MsgDirection::D2L;
+    // Connect to dst addr.
+    let conn = match TcpStream::connect(addr.dst_addr.clone()).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            // This port is dead.
+            eprintln!("Failed to connect to {}: {}", addr.dst_addr, e);
+            let _ = tx
+                .send(Msg {
+                    addr,
+                    dir,
+                    typ: MsgType::MapDisconnect,
+                })
+                .await;
+            return;
+        }
+    };
+    addr.remap_addr = conn.local_addr().unwrap();
+    // Tell lst port that we have connected.
+    if let Err(e) = tx
+        .send(Msg {
+            addr: addr.clone(),
+            dir,
+            typ: MsgType::MapConnected,
+        })
+        .await
+    {
+        // This port is dead.
+        eprintln!("Failed to send msg: {}", e);
+        return;
+    }
+
+    let (rh, wh) = conn.into_split();
+
+    loop {
+        tokio::select! {
+            _ = rh.readable() => {
+                let mut read_buf: Vec<u8> = Vec::new();
+                match rh.try_read_buf(&mut read_buf) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Failed to read from {}: {}", addr.dst_addr, e);
+                        // This port is dead.
+                        let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
+                        return;
+                    }
+                };
+                // Send msg to peer.
+                if let Err(e) = tx.send(Msg {addr: addr.clone(), dir, typ: MsgType::MapData(read_buf)}).await {
+                    eprintln!("Failed to send msg: {}", e);
+                    return;
+                }
+            }
+            // Write to wh.
+            _ = wh.writable(), if data_to_write.len() > 0 || data_writing.is_some() => {
+                if data_writing.is_some() {
+                    let data = data_writing.as_ref().unwrap();
+                    let len = data.len();
+                    let s = match wh.try_write(&data[written_bytes..len]) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
+                            eprintln!("Failed to write to wh: {}", e);
+                            return;
+                        }
+                    };
+                    written_bytes += s;
+                    assert!(written_bytes <= len);
+                    if written_bytes == len {
+                        data_writing = data_to_write.pop_front();
+                        written_bytes = 0;
+                    }
+                } else {
+                    data_writing = data_to_write.pop_front();
+                    written_bytes = 0;
+                }
+            }
+            // Receive msg from lst port.
+            r = rx.recv() => {
+                match r {
+                    Some(Msg {addr: _, dir: _, typ}) => {
+                        match typ {
+                            MsgType::MapDisconnect => {
+                                return;
+                            }
+                            MsgType::MapData(data) => {
+                                // Write these data to socket.
+                                data_to_write.push_back(data);
+                            }
+                            _ => {
+                                // Unknown msg type.
+                                eprintln!("Unknown msg type");
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("Failed to recv msg");
+                        let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -322,7 +501,6 @@ async fn port(
     local_addr: SocketAddr,
     dst_addr: SocketAddr,
 ) {
-    // TODO
     let mut data_to_write: VecDeque<Vec<u8>> = VecDeque::new();
     let mut writing_buf: Option<Vec<u8>> = None;
     let mut written_bytes: usize = 0;
@@ -341,6 +519,7 @@ async fn port(
                 remap_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
                 dst_addr: dst_addr.clone(),
             },
+            dir: MsgDirection::L2D,
             typ: MsgType::MapConnecting,
         })
         .await
@@ -368,6 +547,7 @@ async fn port(
                     remap_addr: remap_addr.as_ref().unwrap().clone(),
                     dst_addr: dst_addr.clone(),
                 },
+                dir: MsgDirection::L2D,
                 typ: MsgType::MapData(read_buf),
             };
             // Send msg to router.
@@ -407,7 +587,7 @@ async fn port(
         }
         // Receive msg from router
         m = rx.recv() => {
-            let Msg {addr, typ} = if let Some(m) = m {
+            let Msg {addr, dir: _, typ} = if let Some(m) = m {
                 m
             } else {
                 eprintln!("Failed to receive msg from router");

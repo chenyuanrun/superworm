@@ -11,7 +11,14 @@ use tokio::net::tcp::OwnedWriteHalf;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Msg {
     pub addr: AddrPair,
+    pub dir: MsgDirection,
     pub typ: MsgType,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub enum MsgDirection {
+    L2D,
+    D2L,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -19,9 +26,10 @@ pub enum MsgType {
     MapData(Vec<u8>),
     MapConnecting,
     MapConnected,
+    MapDisconnect,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AddrPair {
     pub local_addr: SocketAddr,
     pub lst_addr: SocketAddr,
