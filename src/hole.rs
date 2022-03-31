@@ -18,8 +18,6 @@ pub async fn hole(eps: Vec<SocketAddr>) {
 
     loop {
         sleep(Duration::from_secs(1)).await;
-        eprintln!("tick");
-        // TODO: exit gracefully.
     }
 }
 

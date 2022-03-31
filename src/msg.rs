@@ -37,7 +37,6 @@ pub struct AddrPair {
     pub dst_addr: SocketAddr,
 }
 
-// TODO: Should resize vec before read.
 pub struct MsgCtx<RM, WM> {
     frag_size: Option<usize>,
     read_size: usize,

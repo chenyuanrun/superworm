@@ -143,12 +143,12 @@ impl Endpoint {
                 }
                 typ => {
                     match dir {
-                        MsgDirection::L2D => {
+                        MsgDirection::D2L => {
                             let key = (addr.lst_addr.clone(), addr.dst_addr.clone());
                             if let Some(tx) = self.port_mappers.get(&key) {
                                 if let Err(_) = tx
                                     .send(Msg {
-                                        addr,
+                                        addr: addr.clone(),
                                         dir: MsgDirection::L2D,
                                         typ,
                                     })
@@ -156,13 +156,18 @@ impl Endpoint {
                                 {
                                     // This map is dead.
                                     self.port_mappers.remove(&key);
+                                    self.msg_ctx.queue_tx_msg(Msg {
+                                        addr,
+                                        dir: MsgDirection::D2L,
+                                        typ: MsgType::MapDisconnect,
+                                    });
                                 }
                             } else {
                                 // No match for this msg.
                                 eprintln!("No match for {}->{}", key.0, key.1);
                             }
                         }
-                        MsgDirection::D2L => {
+                        MsgDirection::L2D => {
                             let key = (
                                 addr.lst_addr.clone(),
                                 addr.dst_addr.clone(),
@@ -171,7 +176,7 @@ impl Endpoint {
                             if let Some(tx) = self.dst_ports.get(&key) {
                                 if let Err(_) = tx
                                     .send(Msg {
-                                        addr,
+                                        addr: addr.clone(),
                                         dir: MsgDirection::D2L,
                                         typ,
                                     })
@@ -179,6 +184,11 @@ impl Endpoint {
                                 {
                                     // This port is dead.
                                     self.dst_ports.remove(&key);
+                                    self.msg_ctx.queue_tx_msg(Msg {
+                                        addr,
+                                        dir: MsgDirection::D2L,
+                                        typ: MsgType::MapDisconnect,
+                                    });
                                 }
                             }
                         }
@@ -219,7 +229,6 @@ impl Endpoint {
                 self.port_mappers.insert(key, mapper_tx);
             }
             Action::MapRm { lst_addr, dst_addr } => {
-                // TODO: Stop mapper.
                 // Remove mapper from Endpoint.
                 self.port_mappers.remove(&(lst_addr, dst_addr));
             }
@@ -445,7 +454,6 @@ impl PortMapper {
                     Err(e) => {
                         // If we failed to listen, this mapper is dead.
                         eprintln!("Failed to accept {}: {}", self.lst_addr, e);
-                        // TODO: Maybe do some clean.
                         return;
                     }
                 };
@@ -462,7 +470,6 @@ impl PortMapper {
                 } else {
                     // Maybe this mapper is dead.
                     eprintln!("Failed to recv msg for {}", self.lst_addr);
-                    // TODO: Do some clean.
                     return;
                 };
                 // Now process msg...
@@ -498,25 +505,26 @@ async fn port(
     local_addr: SocketAddr,
     dst_addr: SocketAddr,
 ) {
+    let dir = MsgDirection::L2D;
     let mut data_to_write: VecDeque<Vec<u8>> = VecDeque::new();
     let mut writing_buf: Option<Vec<u8>> = None;
     let mut written_bytes: usize = 0;
     let mut read_buf: Vec<u8> = Vec::new();
-    let mut remap_addr: Option<SocketAddr> = None;
     let mut can_read = false;
+    let mut addr = AddrPair {
+        local_addr,
+        lst_addr,
+        remap_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+        dst_addr,
+    };
 
     let (rh, wh) = conn.into_split();
 
     // Send a msg to the peer.
     if let Err(e) = tx
         .send(Msg {
-            addr: AddrPair {
-                local_addr: local_addr.clone(),
-                lst_addr: lst_addr.clone(),
-                remap_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-                dst_addr: dst_addr.clone(),
-            },
-            dir: MsgDirection::L2D,
+            addr: addr.clone(),
+            dir,
             typ: MsgType::MapConnecting,
         })
         .await
@@ -535,17 +543,13 @@ async fn port(
                     Err(e) => {
                         eprintln!("Failed to read from {}: {}", local_addr, e);
                         // This port is dead.
+                        let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                         return;
                     }
                 };
                 let msg = Msg {
-                    addr: AddrPair {
-                        local_addr: local_addr.clone(),
-                        lst_addr: lst_addr.clone(),
-                        remap_addr: remap_addr.as_ref().unwrap().clone(),
-                        dst_addr: dst_addr.clone(),
-                    },
-                    dir: MsgDirection::L2D,
+                    addr: addr.clone(),
+                    dir,
                     typ: MsgType::MapData(read_buf),
                 };
                 // Send msg to router.
@@ -568,6 +572,7 @@ async fn port(
                         Err(e) => {
                             eprintln!("Failed to write to {}: {}", local_addr, e);
                             // This port is dead.
+                            let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                             return;
                         }
                     };
@@ -585,11 +590,12 @@ async fn port(
             }
             // Receive msg from router
             m = rx.recv() => {
-                let Msg {addr, dir: _, typ} = if let Some(m) = m {
+                let Msg {addr: _addr, dir: _, typ} = if let Some(m) = m {
                     m
                 } else {
                     eprintln!("Failed to receive msg from router");
                     // This port is dead.
+                    let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                     return;
                 };
                 // Now process msg.
@@ -599,9 +605,13 @@ async fn port(
                     },
                     MsgType::MapConnected => {
                         // We can read data now.
-                        remap_addr = Some(addr.remap_addr);
+                        addr.remap_addr = _addr.remap_addr;
                         can_read = true;
                     },
+                    MsgType::MapDisconnect => {
+                        // This port is dead.
+                        return;
+                    }
                     _ => {
                         // We can not handle this msg.
                         eprintln!("Unknown msg type");
