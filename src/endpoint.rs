@@ -170,6 +170,13 @@ impl Endpoint {
                                 {
                                     // This map is dead.
                                     self.port_mappers.remove(&key);
+                                    trace!(
+                                        "{}:{} Remove map {}<=>{}",
+                                        file!(),
+                                        line!(),
+                                        key.0,
+                                        key.1
+                                    );
                                     self.msg_ctx.queue_tx_msg(Msg {
                                         addr,
                                         dir: MsgDirection::D2L,
@@ -198,6 +205,14 @@ impl Endpoint {
                                 {
                                     // This port is dead.
                                     self.dst_ports.remove(&key);
+                                    trace!(
+                                        "{}/{} Remove map {}<=>{}<=>{}",
+                                        file!(),
+                                        line!(),
+                                        key.0,
+                                        key.1,
+                                        key.2
+                                    );
                                     self.msg_ctx.queue_tx_msg(Msg {
                                         addr,
                                         dir: MsgDirection::D2L,
@@ -484,8 +499,8 @@ struct PortMapper {
     mapper_rx: Receiver<Msg>,
     // Mapper/Port -> router
     router_tx: Sender<Msg>,
-    // key: (lst_addr, dst_addr)
-    ports: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Msg>>,
+    // key: (lst_addr, dst_addr, local_addr)
+    ports: HashMap<(SocketAddr, SocketAddr, SocketAddr), mpsc::Sender<Msg>>,
 }
 
 impl PortMapper {
@@ -504,42 +519,48 @@ impl PortMapper {
                 return;
             }
         };
-        // Wait for connection and messages.
-        tokio::select! {
-            // New connection.
-            r = lst.accept() => {
-                let (conn, addr) = match r {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // If we failed to listen, this mapper is dead.
-                        error!("{}:{} Failed to accept {}: {}", file!(), line!(), self.lst_addr, e);
+        loop {
+            // Wait for connection and messages.
+            tokio::select! {
+                // New connection.
+                r = lst.accept() => {
+                    let (conn, addr) = match r {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // If we failed to listen, this mapper is dead.
+                            error!("{}:{} Failed to accept {}: {}", file!(), line!(), self.lst_addr, e);
+                            return;
+                        }
+                    };
+                    trace!("{}:{} Accept connection {}", file!(), line!(), addr);
+                    let key = (self.lst_addr.clone(), self.dst_addr.clone(), addr.clone());
+                    // PortMapper -> Port
+                    let (port_tx, port_rx) = mpsc::channel(1024);
+                    self.ports.insert(key, port_tx);
+                    tokio::spawn(port(port_rx, self.router_tx.clone(), conn, self.lst_addr, addr, self.dst_addr));
+                }
+                // New msg.
+                r = self.mapper_rx.recv() => {
+                    let msg = if let Some(msg) = r {
+                        msg
+                    } else {
+                        // Maybe this mapper is dead.
+                        error!("{}:{} Failed to recv msg for {}", file!(), line!(), self.lst_addr);
                         return;
-                    }
-                };
-                trace!("{}:{} Accept connection {}", file!(), line!(), addr);
-                let key = (self.lst_addr.clone(), addr.clone());
-                // PortMapper -> Port
-                let (port_tx, port_rx) = mpsc::channel(1024);
-                self.ports.insert(key, port_tx);
-                tokio::spawn(port(port_rx, self.router_tx.clone(), conn, self.lst_addr, addr, self.dst_addr));
-            }
-            // New msg.
-            r = self.mapper_rx.recv() => {
-                let msg = if let Some(msg) = r {
-                    msg
-                } else {
-                    // Maybe this mapper is dead.
-                    error!("{}:{} Failed to recv msg for {}", file!(), line!(), self.lst_addr);
-                    return;
-                };
-                // Now process msg...
-                self.process_msg(msg).await;
+                    };
+                    // Now process msg...
+                    self.process_msg(msg).await;
+                }
             }
         }
     }
 
     async fn process_msg(&mut self, msg: Msg) {
-        let key = (msg.addr.lst_addr.clone(), msg.addr.dst_addr.clone());
+        let key = (
+            msg.addr.lst_addr.clone(),
+            msg.addr.dst_addr.clone(),
+            msg.addr.local_addr.clone(),
+        );
         // Send msg to lst port.
         if let Some(tx) = self.ports.get_mut(&key) {
             let lst_addr = msg.addr.lst_addr.clone();
@@ -552,6 +573,14 @@ impl PortMapper {
                     e
                 );
                 // This port is dead.
+                trace!(
+                    "{}/{} Remove map {}<=>{}<=>{}",
+                    file!(),
+                    line!(),
+                    key.0,
+                    key.1,
+                    key.2
+                );
                 self.ports.remove(&key);
             }
         } else {
