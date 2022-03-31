@@ -39,7 +39,8 @@ pub struct AddrPair {
 
 // TODO: Should resize vec before read.
 pub struct MsgCtx<RM, WM> {
-    read_size: Option<usize>,
+    frag_size: Option<usize>,
+    read_size: usize,
     read_buf: Vec<u8>,
     msgs_from_read: VecDeque<RM>,
 
@@ -51,7 +52,8 @@ pub struct MsgCtx<RM, WM> {
 impl<RM, WM> MsgCtx<RM, WM> {
     pub fn new() -> Self {
         MsgCtx {
-            read_size: None,
+            frag_size: None,
+            read_size: 0,
             read_buf: Vec::with_capacity(2048),
             msgs_from_read: VecDeque::new(),
 
@@ -83,34 +85,51 @@ where
     RM: DeserializeOwned,
 {
     pub fn handle_read(&mut self, readhalf: &mut OwnedReadHalf) -> Result<(), std::io::Error> {
-        if self.read_size.is_none() {
-            let len = self.read_buf.len();
-            readhalf.try_read(&mut self.read_buf[len..size_of::<u64>()])?;
-            if self.read_buf.len() != size_of::<u64>() {
+        if self.frag_size.is_none() {
+            // Read size of fragment.
+            if self.read_buf.len() < size_of::<u64>() {
+                self.read_buf.resize(size_of::<u64>(), 0);
+            }
+            self.read_size +=
+                match readhalf.try_read(&mut self.read_buf[self.read_size..size_of::<u64>()]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.frag_size = None;
+                        self.read_size = 0;
+                        self.read_buf.clear();
+                        return Err(e);
+                    }
+                };
+            assert!(self.read_size <= size_of::<u64>());
+            if self.read_size < size_of::<u64>() {
                 // Need to read more.
                 return Ok(());
             }
-            self.read_size =
+            self.frag_size =
                 Some(u64::from_be_bytes(self.read_buf[..].try_into().unwrap()) as usize);
+            self.read_size = 0;
             self.read_buf.clear();
-        }
-        let read_size = self.read_size.unwrap();
-        if read_size > 1024 * 1024 * 100 {
-            eprintln!("read_size is too large: {}", read_size);
-            self.read_size = None;
-            self.read_buf.clear();
-            return Err(std::io::Error::from_raw_os_error(22));
+
+            if self.frag_size.unwrap() > 1024 * 1024 * 100 {
+                eprintln!("read_size is too large: {}", self.frag_size.unwrap());
+                self.frag_size = None;
+                return Err(std::io::Error::from_raw_os_error(22));
+            }
+            self.read_buf.resize(self.frag_size.unwrap(), 0);
         }
 
-        // Reserve enough space for data.
-        if self.read_buf.capacity() < read_size {
-            self.read_buf.reserve(read_size - self.read_buf.len());
-        }
-
-        // Now try to read data.
-        let len = self.read_buf.len();
-        readhalf.try_read(&mut self.read_buf[len..read_size])?;
-        if self.read_buf.len() != read_size {
+        let frag_size = self.frag_size.unwrap();
+        self.read_size += match readhalf.try_read(&mut self.read_buf[self.read_size..frag_size]) {
+            Ok(s) => s,
+            Err(e) => {
+                self.frag_size = None;
+                self.read_size = 0;
+                self.read_buf.clear();
+                return Err(e);
+            }
+        };
+        assert!(self.read_size <= frag_size);
+        if self.read_size < frag_size {
             // Need more data.
             return Ok(());
         }
@@ -126,7 +145,8 @@ where
                 Err(std::io::Error::from_raw_os_error(22))
             }
         };
-        self.read_size = None;
+        self.frag_size = None;
+        self.read_size = 0;
         self.read_buf.clear();
         res
     }

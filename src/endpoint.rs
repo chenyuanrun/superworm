@@ -3,9 +3,7 @@ use crate::msg::{AddrPair, Msg, MsgCtx, MsgDirection, MsgType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
-use std::iter::Scan;
 use std::net::SocketAddr;
-use tokio::fs::write;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::{
@@ -237,7 +235,6 @@ impl Endpoint {
 }
 
 async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Receiver<Msg>) {
-    // TODO
     let mut data_to_write: VecDeque<Vec<u8>> = VecDeque::new();
     let mut data_writing: Option<Vec<u8>> = None;
     let mut written_bytes: usize = 0;
@@ -365,7 +362,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
     loop {
         tokio::select! {
             // Read from Hole.
-            r = readhalf.readable() => {
+            _ = readhalf.readable() => {
                 if let Err(e) = ep.msg_ctx.handle_read(&mut readhalf) {
                     eprintln!("Failed to handle read: {}", e);
                     let (conn, _) = accept(&mut listener).await;
@@ -376,7 +373,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
                 ep.handle_msgs().await;
             }
             // Write to Hole.
-            r = writehalf.writable(), if ep.msg_ctx.need_to_write() => {
+            _ = writehalf.writable(), if ep.msg_ctx.need_to_write() => {
                 if let Err(e) = ep.msg_ctx.handle_write(&mut writehalf) {
                     eprintln!("Failed to handle write: {}", e);
                     let (conn, _) = accept(&mut listener).await;
@@ -529,85 +526,87 @@ async fn port(
         return;
     };
 
-    tokio::select! {
-        // Read from local addr.
-        _ = rh.readable(), if can_read => {
-            match rh.try_read_buf(&mut read_buf) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to read from {}: {}", local_addr, e);
-                    // This port is dead.
-                    return;
-                }
-            };
-            let msg = Msg {
-                addr: AddrPair {
-                    local_addr: local_addr.clone(),
-                    lst_addr: lst_addr.clone(),
-                    remap_addr: remap_addr.as_ref().unwrap().clone(),
-                    dst_addr: dst_addr.clone(),
-                },
-                dir: MsgDirection::L2D,
-                typ: MsgType::MapData(read_buf),
-            };
-            // Send msg to router.
-            if let Err(e) = tx.send(msg).await {
-                eprintln!("Failed to send msg to route for {}: {}", lst_addr, e);
-                // This port is dead.
-                return;
-            }
-            // Create a new read buffer.
-            read_buf = Vec::new();
-        }
-        // Write to local addr.
-        _ = wh.writable(), if writing_buf.is_some() || data_to_write.len() != 0 => {
-            if writing_buf.is_some() {
-                // Continue to write.
-                let writing_buf_ref = writing_buf.as_ref().unwrap();
-                let len = writing_buf_ref.len();
-                let s = match wh.try_write(&writing_buf_ref[written_bytes..len]) {
+    loop {
+        tokio::select! {
+            // Read from local addr.
+            _ = rh.readable(), if can_read => {
+                match rh.try_read_buf(&mut read_buf) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("Failed to write to {}: {}", local_addr, e);
+                        eprintln!("Failed to read from {}: {}", local_addr, e);
                         // This port is dead.
                         return;
                     }
                 };
-                written_bytes += s;
-                assert!(written_bytes <= len);
-                if written_bytes == len {
-                    // This segment of data is all written.
-                    writing_buf = data_to_write.pop_front();
-                    written_bytes = 0;
+                let msg = Msg {
+                    addr: AddrPair {
+                        local_addr: local_addr.clone(),
+                        lst_addr: lst_addr.clone(),
+                        remap_addr: remap_addr.as_ref().unwrap().clone(),
+                        dst_addr: dst_addr.clone(),
+                    },
+                    dir: MsgDirection::L2D,
+                    typ: MsgType::MapData(read_buf),
+                };
+                // Send msg to router.
+                if let Err(e) = tx.send(msg).await {
+                    eprintln!("Failed to send msg to route for {}: {}", lst_addr, e);
+                    // This port is dead.
+                    return;
                 }
-            } else {
-                // writing_buf will be written next time.
-                writing_buf = data_to_write.pop_front();
+                // Create a new read buffer.
+                read_buf = Vec::new();
             }
-        }
-        // Receive msg from router
-        m = rx.recv() => {
-            let Msg {addr, dir: _, typ} = if let Some(m) = m {
-                m
-            } else {
-                eprintln!("Failed to receive msg from router");
-                // This port is dead.
-                return;
-            };
-            // Now process msg.
-            match typ {
-                MsgType::MapData(data) => {
-                    data_to_write.push_back(data);
-                },
-                MsgType::MapConnected => {
-                    // We can read data now.
-                    remap_addr = Some(addr.remap_addr);
-                    can_read = true;
-                },
-                _ => {
-                    // We can not handle this msg.
-                    eprintln!("Unknown msg type");
-                },
+            // Write to local addr.
+            _ = wh.writable(), if writing_buf.is_some() || data_to_write.len() != 0 => {
+                if writing_buf.is_some() {
+                    // Continue to write.
+                    let writing_buf_ref = writing_buf.as_ref().unwrap();
+                    let len = writing_buf_ref.len();
+                    let s = match wh.try_write(&writing_buf_ref[written_bytes..len]) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Failed to write to {}: {}", local_addr, e);
+                            // This port is dead.
+                            return;
+                        }
+                    };
+                    written_bytes += s;
+                    assert!(written_bytes <= len);
+                    if written_bytes == len {
+                        // This segment of data is all written.
+                        writing_buf = data_to_write.pop_front();
+                        written_bytes = 0;
+                    }
+                } else {
+                    // writing_buf will be written next time.
+                    writing_buf = data_to_write.pop_front();
+                }
+            }
+            // Receive msg from router
+            m = rx.recv() => {
+                let Msg {addr, dir: _, typ} = if let Some(m) = m {
+                    m
+                } else {
+                    eprintln!("Failed to receive msg from router");
+                    // This port is dead.
+                    return;
+                };
+                // Now process msg.
+                match typ {
+                    MsgType::MapData(data) => {
+                        data_to_write.push_back(data);
+                    },
+                    MsgType::MapConnected => {
+                        // We can read data now.
+                        remap_addr = Some(addr.remap_addr);
+                        can_read = true;
+                    },
+                    _ => {
+                        // We can not handle this msg.
+                        eprintln!("Unknown msg type");
+                    },
+                }
             }
         }
     }
