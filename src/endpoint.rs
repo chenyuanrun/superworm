@@ -1,5 +1,6 @@
 use crate::cli::Action;
 use crate::msg::{AddrPair, Msg, MsgCtx, MsgDirection, MsgType};
+use log::{error, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
@@ -11,12 +12,12 @@ use tokio::{
     sync::mpsc::{self, Sender},
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Ctl {
     Act(Action),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum CtlRsp {
     Msg(i32, String),
     MapLs(Vec<(SocketAddr, SocketAddr)>),
@@ -43,7 +44,9 @@ type CtlChanMsg = (Ctl, oneshot::Sender<CtlRsp>);
 pub async fn endpoint(addr: SocketAddr, cli_addr: SocketAddr) {
     let (ctl_tx, ctl_rx) = mpsc::channel::<CtlChanMsg>(1024);
     tokio::spawn(route(addr, ctl_rx));
-    handle_cli(ctl_tx, cli_addr).await;
+    loop {
+        handle_cli(ctl_tx.clone(), cli_addr.clone()).await;
+    }
 }
 
 async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
@@ -55,7 +58,8 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
             panic!("Failed to bind to {}: {}", cli_addr, e);
         }
     };
-    let (conn, _) = accept(&mut listener).await;
+    let (conn, addr) = accept(&mut listener).await;
+    trace!("{}:{} Accept connection from {}", file!(), line!(), addr);
     let (mut readhalf, mut writehalf) = conn.into_split();
 
     loop {
@@ -63,7 +67,11 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
             // Read from cli
             _ = readhalf.readable() => {
                 if let Err(e) = msg_ctx.handle_read(&mut readhalf) {
-                    eprintln!("{}:{} Failed to handle read: {}", file!(), line!(), e);
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    error!("{}:{} Failed to handle read: {}", file!(), line!(), e);
+                    msg_ctx.reset_read();
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -72,6 +80,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
                 // Send Ctl to router and wait for CtlRsp
                 loop {
                     if let Some(ctl) = msg_ctx.pop_rx_msg() {
+                        trace!("{}:{} Got ctl {:?}", file!(), line!(), ctl);
                         let (oneshot_tx, oneshot_rx) = oneshot::channel();
                         if let Err(e) = tx.send((ctl, oneshot_tx)).await {
                             panic!("Ctl receive closed: {}", e);
@@ -82,6 +91,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
                                 panic!("Expect a CtlRsp: {}", e);
                             }
                         };
+                        trace!("{}:{} Got ctl rsp {:?}", file!(), line!(), rsp);
                         msg_ctx.queue_tx_msg(rsp);
                     } else {
                         break;
@@ -91,7 +101,11 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
             // Write to cli
             _ = writehalf.writable(), if msg_ctx.need_to_write() => {
                 if let Err(e) = msg_ctx.handle_write(&mut writehalf) {
-                    eprintln!("{}:{} Failed to handle write: {}", file!(), line!(), e);
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    error!("{}:{} Failed to handle write: {}", file!(), line!(), e);
+                    msg_ctx.reset_write();
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -164,13 +178,7 @@ impl Endpoint {
                                 }
                             } else {
                                 // No match for this msg.
-                                eprintln!(
-                                    "{}:{} No match for {}->{}",
-                                    file!(),
-                                    line!(),
-                                    key.0,
-                                    key.1
-                                );
+                                error!("{}:{} No match for {}->{}", file!(), line!(), key.0, key.1);
                             }
                         }
                         MsgDirection::L2D => {
@@ -214,6 +222,7 @@ impl Endpoint {
     async fn handle_action(&mut self, act: Action, oneshot_tx: oneshot::Sender<CtlRsp>) {
         match act {
             Action::MapAdd { lst_addr, dst_addr } => {
+                trace!("{}:{} MapAdd {}<=>{}", file!(), line!(), lst_addr, dst_addr);
                 let key = (lst_addr.clone(), dst_addr.clone());
                 if self.port_mappers.contains_key(&key) {
                     let _ = oneshot_tx.send(CtlRsp::Msg(
@@ -236,11 +245,13 @@ impl Endpoint {
                 let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapAdd successfully".into()));
             }
             Action::MapRm { lst_addr, dst_addr } => {
+                trace!("{}/{} MapRm {}<=>{}", file!(), line!(), lst_addr, dst_addr);
                 // Remove mapper from Endpoint.
                 self.port_mappers.remove(&(lst_addr, dst_addr));
                 let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapRm successfully".into()));
             }
             Action::MapLs => {
+                trace!("{}/{} MapLs", file!(), line!());
                 let mut mapls = Vec::new();
                 for (lst_addr, dst_addr) in self.port_mappers.keys() {
                     mapls.push((lst_addr.clone(), dst_addr.clone()));
@@ -261,7 +272,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
         Ok(conn) => conn,
         Err(e) => {
             // This port is dead.
-            eprintln!(
+            error!(
                 "{}:{} Failed to connect to {}: {}",
                 file!(),
                 line!(),
@@ -278,6 +289,13 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
             return;
         }
     };
+    trace!(
+        "{}:{} Connected to dstaddr: {}->{}",
+        file!(),
+        line!(),
+        addr.local_addr,
+        conn.local_addr().unwrap()
+    );
     addr.remap_addr = conn.local_addr().unwrap();
     // Tell lst port that we have connected.
     if let Err(e) = tx
@@ -289,7 +307,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
         .await
     {
         // This port is dead.
-        eprintln!("{}:{} Failed to send msg: {}", file!(), line!(), e);
+        error!("{}:{} Failed to send msg: {}", file!(), line!(), e);
         return;
     }
 
@@ -300,9 +318,19 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
             _ = rh.readable() => {
                 let mut read_buf: Vec<u8> = Vec::new();
                 match rh.try_read_buf(&mut read_buf) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        if s == 0 {
+                            trace!("{}/{} Read zero bytes", file!(), line!());
+                            // This port is dead.
+                            let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
+                            return;
+                        }
+                    },
                     Err(e) => {
-                        eprintln!("{}:{} Failed to read from {}: {}", file!(), line!(), addr.dst_addr, e);
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            continue;
+                        }
+                        error!("{}:{} Failed to read from {}: {}", file!(), line!(), addr.dst_addr, e);
                         // This port is dead.
                         let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                         return;
@@ -310,7 +338,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                 };
                 // Send msg to peer.
                 if let Err(e) = tx.send(Msg {addr: addr.clone(), dir, typ: MsgType::MapData(read_buf)}).await {
-                    eprintln!("{}:{} Failed to send msg: {}", file!(), line!(), e);
+                    error!("{}:{} Failed to send msg: {}", file!(), line!(), e);
                     return;
                 }
             }
@@ -322,8 +350,11 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                     let s = match wh.try_write(&data[written_bytes..len]) {
                         Ok(s) => s,
                         Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                continue;
+                            }
+                            error!("{}:{} Failed to write to wh: {}", file!(), line!(), e);
                             let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
-                            eprintln!("{}:{} Failed to write to wh: {}", file!(), line!(), e);
                             return;
                         }
                     };
@@ -352,12 +383,12 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                             }
                             _ => {
                                 // Unknown msg type.
-                                eprintln!("{}:{} Unknown msg type", file!(), line!());
+                                error!("{}:{} Unknown msg type", file!(), line!());
                             }
                         }
                     }
                     None => {
-                        eprintln!("{}:{} Failed to recv msg", file!(), line!());
+                        error!("{}:{} Failed to recv msg", file!(), line!());
                         let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                         return;
                     }
@@ -387,7 +418,11 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
             // Read from Hole.
             _ = readhalf.readable() => {
                 if let Err(e) = ep.msg_ctx.handle_read(&mut readhalf) {
-                    eprintln!("{}:{} Failed to handle read: {}", file!(), line!(), e);
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    error!("{}:{} Failed to handle read: {}", file!(), line!(), e);
+                    ep.msg_ctx.reset_read();
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -398,7 +433,11 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
             // Write to Hole.
             _ = writehalf.writable(), if ep.msg_ctx.need_to_write() => {
                 if let Err(e) = ep.msg_ctx.handle_write(&mut writehalf) {
-                    eprintln!("{}:{} Failed to handle write: {}", file!(), line!(), e);
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    error!("{}:{} Failed to handle write: {}", file!(), line!(), e);
+                    ep.msg_ctx.reset_write();
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -411,7 +450,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
                     // Handle ctl and then response.
                     ep.handle_ctl(ctl, oneshot_tx).await;
                 } else {
-                    eprintln!("{}:{} ctl_rx closed", file!(), line!());
+                    error!("{}:{} ctl_rx closed", file!(), line!());
                     ctl_rx_closed = true;
                 }
             }
@@ -421,7 +460,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
                     // This msg should send to hole
                     ep.msg_ctx.queue_tx_msg(msg);
                 } else {
-                    eprintln!("{}:{} mapper_rx closed", file!(), line!());
+                    error!("{}:{} mapper_rx closed", file!(), line!());
                     mapper_rx_closed = true;
                 }
             }
@@ -455,7 +494,7 @@ impl PortMapper {
         let lst = match TcpListener::bind(&self.lst_addr).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
+                error!(
                     "{}:{} Failed to listen on {}: {}",
                     file!(),
                     line!(),
@@ -473,10 +512,11 @@ impl PortMapper {
                     Ok(v) => v,
                     Err(e) => {
                         // If we failed to listen, this mapper is dead.
-                        eprintln!("{}:{} Failed to accept {}: {}", file!(), line!(), self.lst_addr, e);
+                        error!("{}:{} Failed to accept {}: {}", file!(), line!(), self.lst_addr, e);
                         return;
                     }
                 };
+                trace!("{}:{} Accept connection {}", file!(), line!(), addr);
                 let key = (self.lst_addr.clone(), addr.clone());
                 // PortMapper -> Port
                 let (port_tx, port_rx) = mpsc::channel(1024);
@@ -489,7 +529,7 @@ impl PortMapper {
                     msg
                 } else {
                     // Maybe this mapper is dead.
-                    eprintln!("{}:{} Failed to recv msg for {}", file!(), line!(), self.lst_addr);
+                    error!("{}:{} Failed to recv msg for {}", file!(), line!(), self.lst_addr);
                     return;
                 };
                 // Now process msg...
@@ -500,10 +540,11 @@ impl PortMapper {
 
     async fn process_msg(&mut self, msg: Msg) {
         let key = (msg.addr.lst_addr.clone(), msg.addr.dst_addr.clone());
+        // Send msg to lst port.
         if let Some(tx) = self.ports.get_mut(&key) {
             let lst_addr = msg.addr.lst_addr.clone();
             if let Err(e) = tx.send(msg).await {
-                eprintln!(
+                error!(
                     "{}:{} Failed to send msg to {}: {}",
                     file!(),
                     line!(),
@@ -515,7 +556,7 @@ impl PortMapper {
             }
         } else {
             // No port match for this msg, just drop it.
-            eprintln!(
+            error!(
                 "{}:{} No port match for msg, local_addr: {}, lst_addr: {}, remap_addr: {}, dst_addr: {}", file!(), line!(),
                 msg.addr.local_addr, msg.addr.lst_addr, msg.addr.remap_addr, msg.addr.dst_addr
             );
@@ -555,7 +596,7 @@ async fn port(
         })
         .await
     {
-        eprintln!(
+        error!(
             "{}:{} Failed to send MapConnecting to peer: {}",
             file!(),
             line!(),
@@ -570,9 +611,19 @@ async fn port(
             // Read from local addr.
             _ = rh.readable(), if can_read => {
                 match rh.try_read_buf(&mut read_buf) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        if s == 0 {
+                            trace!("{}/{} Read zero byte", file!(), line!());
+                            // This port is dead.
+                            let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
+                            return;
+                        }
+                    },
                     Err(e) => {
-                        eprintln!("{}:{} Failed to read from {}: {}", file!(), line!(), local_addr, e);
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            continue;
+                        }
+                        error!("{}:{} Failed to read from {}: {}", file!(), line!(), local_addr, e);
                         // This port is dead.
                         let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                         return;
@@ -585,7 +636,7 @@ async fn port(
                 };
                 // Send msg to router.
                 if let Err(e) = tx.send(msg).await {
-                    eprintln!("{}:{} Failed to send msg to route for {}: {}", file!(), line!(), lst_addr, e);
+                    error!("{}:{} Failed to send msg to route for {}: {}", file!(), line!(), lst_addr, e);
                     // This port is dead.
                     return;
                 }
@@ -601,7 +652,10 @@ async fn port(
                     let s = match wh.try_write(&writing_buf_ref[written_bytes..len]) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("{}:{} Failed to write to {}: {}", file!(), line!(), local_addr, e);
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                continue;
+                            }
+                            error!("{}:{} Failed to write to {}: {}", file!(), line!(), local_addr, e);
                             // This port is dead.
                             let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                             return;
@@ -624,7 +678,7 @@ async fn port(
                 let Msg {addr: _addr, dir: _, typ} = if let Some(m) = m {
                     m
                 } else {
-                    eprintln!("{}:{} Failed to receive msg from router", file!(), line!());
+                    error!("{}:{} Failed to receive msg from router", file!(), line!());
                     // This port is dead.
                     let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                     return;
@@ -645,7 +699,7 @@ async fn port(
                     }
                     _ => {
                         // We can not handle this msg.
-                        eprintln!("{}:{} Unknown msg type", file!(), line!());
+                        error!("{}:{} Unknown msg type", file!(), line!());
                     },
                 }
             }

@@ -1,3 +1,4 @@
+use log::{error, trace};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -77,6 +78,17 @@ impl<RM, WM> MsgCtx<RM, WM> {
     pub fn queue_tx_msg(&mut self, msg: WM) {
         self.msgs_to_write.push_back(msg);
     }
+
+    pub fn reset_read(&mut self) {
+        self.frag_size = None;
+        self.read_size = 0;
+        self.read_buf.clear();
+    }
+
+    pub fn reset_write(&mut self) {
+        self.written_size = None;
+        self.write_buf.clear();
+    }
 }
 
 impl<RM, WM> MsgCtx<RM, WM>
@@ -91,11 +103,18 @@ where
             }
             self.read_size +=
                 match readhalf.try_read(&mut self.read_buf[self.read_size..size_of::<u64>()]) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        if s == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "Read zero byte",
+                            ));
+                        } else {
+                            s
+                        }
+                    }
                     Err(e) => {
-                        self.frag_size = None;
-                        self.read_size = 0;
-                        self.read_buf.clear();
+                        trace!("{}:{} Failed to read: {}", file!(), line!(), e);
                         return Err(e);
                     }
                 };
@@ -108,15 +127,20 @@ where
                 Some(u64::from_be_bytes(self.read_buf[..].try_into().unwrap()) as usize);
             self.read_size = 0;
             self.read_buf.clear();
+            trace!(
+                "{}:{} frag_size:{}",
+                file!(),
+                line!(),
+                self.frag_size.unwrap()
+            );
 
             if self.frag_size.unwrap() > 1024 * 1024 * 100 {
-                eprintln!(
+                error!(
                     "{}:{} read_size is too large: {}",
                     file!(),
                     line!(),
                     self.frag_size.unwrap()
                 );
-                self.frag_size = None;
                 return Err(std::io::Error::from_raw_os_error(22));
             }
             self.read_buf.resize(self.frag_size.unwrap(), 0);
@@ -124,14 +148,28 @@ where
 
         let frag_size = self.frag_size.unwrap();
         self.read_size += match readhalf.try_read(&mut self.read_buf[self.read_size..frag_size]) {
-            Ok(s) => s,
+            Ok(s) => {
+                if s == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "Read zero byte",
+                    ));
+                } else {
+                    s
+                }
+            }
             Err(e) => {
-                self.frag_size = None;
-                self.read_size = 0;
-                self.read_buf.clear();
+                trace!("{}:{} Failed to read: {}", file!(), line!(), e);
                 return Err(e);
             }
         };
+        trace!(
+            "{}:{} read {}/{}",
+            file!(),
+            line!(),
+            self.read_size,
+            frag_size
+        );
         assert!(self.read_size <= frag_size);
         if self.read_size < frag_size {
             // Need more data.
@@ -141,11 +179,12 @@ where
         // Deserialize.
         let res = match bincode::deserialize::<RM>(&self.read_buf[..]) {
             Ok(msg) => {
+                trace!("{}:{} deserialize msg", file!(), line!());
                 self.msgs_from_read.push_back(msg);
                 Ok(())
             }
             Err(e) => {
-                eprintln!("{}:{} Failed to deserialize: {}", file!(), line!(), e);
+                error!("{}:{} Failed to deserialize: {}", file!(), line!(), e);
                 Err(std::io::Error::from_raw_os_error(22))
             }
         };
@@ -157,12 +196,22 @@ where
 
     pub async fn read(&mut self, readhalf: &mut OwnedReadHalf) -> Result<RM, std::io::Error> {
         if let Some(rmsg) = self.pop_rx_msg() {
+            trace!("{}:{} return exist msg", file!(), line!());
             return Ok(rmsg);
         }
         while !self.have_rx_msg() {
             let _ = readhalf.readable().await;
-            self.handle_read(readhalf)?;
+            match self.handle_read(readhalf) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        self.reset_read();
+                        return Err(e);
+                    }
+                }
+            }
         }
+        trace!("{}:{} Read msg successfully", file!(), line!());
         // There must be msg received here.
         Ok(self.pop_rx_msg().unwrap())
     }
@@ -184,7 +233,7 @@ where
             // Reserve space for size of msg.
             cursor.set_position(size_of::<u64>() as u64);
             if let Err(e) = bincode::serialize_into(&mut cursor, &msg) {
-                eprintln!("{}:{} Failed to serialise: {}", file!(), line!(), e);
+                error!("{}:{} Failed to serialise: {}", file!(), line!(), e);
                 drop(cursor);
                 self.msgs_to_write.push_front(msg);
                 return Err(std::io::Error::from_raw_os_error(22));
@@ -192,25 +241,40 @@ where
             drop(cursor);
             // Setup size for msg.
             let size = (self.write_buf.len() - size_of::<u64>()) as u64;
+            trace!("{}:{} Write msg size {}", file!(), line!(), size);
             let mut size = size.to_be_bytes();
             (&mut self.write_buf[0..size_of::<u64>()]).copy_from_slice(&mut size[..]);
             self.written_size = Some(0);
         }
         // Now try to write to socket.
         let mut written_size = self.written_size.unwrap();
+        trace!(
+            "{}:{} Write before {}/{}",
+            file!(),
+            line!(),
+            written_size,
+            self.write_buf.len()
+        );
         written_size += match writehalf.try_write(&self.write_buf[written_size..]) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("{}:{} Failed to write: {}", file!(), line!(), e);
-                self.written_size = None;
-                self.write_buf.clear();
+                error!("{}:{} Failed to write: {}", file!(), line!(), e);
                 return Err(e);
             }
         };
+        trace!(
+            "{}:{} Write after {}/{}",
+            file!(),
+            line!(),
+            written_size,
+            self.write_buf.len()
+        );
         if written_size == self.write_buf.len() {
             // All data is written.
             self.written_size = None;
             self.write_buf.clear();
+        } else {
+            self.written_size = Some(written_size);
         }
         Ok(())
     }
@@ -223,8 +287,17 @@ where
         self.queue_tx_msg(wmsg);
         while self.need_to_write() {
             let _ = writehalf.writable().await;
-            self.handle_write(writehalf)?;
+            match self.handle_write(writehalf) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        self.reset_write();
+                        return Err(e);
+                    }
+                }
+            };
         }
+        trace!("{}:{} Written msg", file!(), line!());
         Ok(())
     }
 }

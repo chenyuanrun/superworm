@@ -1,3 +1,4 @@
+use log::{error, trace};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -17,7 +18,7 @@ pub struct Cli {
     action: Action,
 }
 
-#[derive(Subcommand, Serialize, Deserialize)]
+#[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum Action {
     #[clap(name = "mapadd")]
     MapAdd {
@@ -42,7 +43,7 @@ pub(crate) async fn cli(arg: Cli) {
     let conn = match TcpStream::connect(arg.cli_addr).await {
         Ok(conn) => conn,
         Err(e) => {
-            eprintln!(
+            error!(
                 "{}:{} Failed to connect to {}: {}",
                 file!(),
                 line!(),
@@ -55,9 +56,10 @@ pub(crate) async fn cli(arg: Cli) {
     let (mut readhalf, mut writehalf) = conn.into_split();
     let mut msg_ctx = MsgCtx::<CtlRsp, Ctl>::new();
     let ctl = Ctl::Act(arg.action);
+    trace!("{}:{} Send ctl to endpoint: {:?}", file!(), line!(), ctl);
     // Send Ctl to endpoint
     if let Err(e) = msg_ctx.write(&mut writehalf, ctl).await {
-        eprintln!(
+        error!(
             "{}:{} Failed to write to {}: {}",
             file!(),
             line!(),
@@ -66,11 +68,12 @@ pub(crate) async fn cli(arg: Cli) {
         );
         return;
     }
+    trace!("{}:{} Waiting for ctl rsp", file!(), line!());
     // Wait result from endpoint
     let rsp = match msg_ctx.read(&mut readhalf).await {
         Ok(rsp) => rsp,
         Err(e) => {
-            eprintln!(
+            error!(
                 "{}:{} Failed to read from {}: {}",
                 file!(),
                 line!(),
@@ -80,6 +83,7 @@ pub(crate) async fn cli(arg: Cli) {
             return;
         }
     };
+    trace!("{}:{} Received ctl rsp: {:?}", file!(), line!(), rsp);
     // Now print the response.
     println!("{}", rsp);
 }

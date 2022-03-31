@@ -33,6 +33,8 @@ enum Type {
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
+
     let args = _Args::parse();
     match args._type {
         Type::Hole { eps } => hole::hole(eps).await,
