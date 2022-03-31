@@ -110,7 +110,12 @@ where
             self.read_buf.clear();
 
             if self.frag_size.unwrap() > 1024 * 1024 * 100 {
-                eprintln!("read_size is too large: {}", self.frag_size.unwrap());
+                eprintln!(
+                    "{}:{} read_size is too large: {}",
+                    file!(),
+                    line!(),
+                    self.frag_size.unwrap()
+                );
                 self.frag_size = None;
                 return Err(std::io::Error::from_raw_os_error(22));
             }
@@ -140,7 +145,7 @@ where
                 Ok(())
             }
             Err(e) => {
-                eprintln!("Failed to deserialize: {}", e);
+                eprintln!("{}:{} Failed to deserialize: {}", file!(), line!(), e);
                 Err(std::io::Error::from_raw_os_error(22))
             }
         };
@@ -179,7 +184,7 @@ where
             // Reserve space for size of msg.
             cursor.set_position(size_of::<u64>() as u64);
             if let Err(e) = bincode::serialize_into(&mut cursor, &msg) {
-                eprintln!("Failed to serialise: {}", e);
+                eprintln!("{}:{} Failed to serialise: {}", file!(), line!(), e);
                 drop(cursor);
                 self.msgs_to_write.push_front(msg);
                 return Err(std::io::Error::from_raw_os_error(22));
@@ -196,7 +201,7 @@ where
         written_size += match writehalf.try_write(&self.write_buf[written_size..]) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to write: {}", e);
+                eprintln!("{}:{} Failed to write: {}", file!(), line!(), e);
                 self.written_size = None;
                 self.write_buf.clear();
                 return Err(e);

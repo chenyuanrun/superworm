@@ -63,7 +63,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
             // Read from cli
             _ = readhalf.readable() => {
                 if let Err(e) = msg_ctx.handle_read(&mut readhalf) {
-                    eprintln!("Failed to handle read: {}", e);
+                    eprintln!("{}:{} Failed to handle read: {}", file!(), line!(), e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -91,7 +91,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
             // Write to cli
             _ = writehalf.writable(), if msg_ctx.need_to_write() => {
                 if let Err(e) = msg_ctx.handle_write(&mut writehalf) {
-                    eprintln!("Failed to handle write: {}", e);
+                    eprintln!("{}:{} Failed to handle write: {}", file!(), line!(), e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -164,7 +164,13 @@ impl Endpoint {
                                 }
                             } else {
                                 // No match for this msg.
-                                eprintln!("No match for {}->{}", key.0, key.1);
+                                eprintln!(
+                                    "{}:{} No match for {}->{}",
+                                    file!(),
+                                    line!(),
+                                    key.0,
+                                    key.1
+                                );
                             }
                         }
                         MsgDirection::L2D => {
@@ -227,10 +233,12 @@ impl Endpoint {
                 // Start port mapper.
                 tokio::spawn(mapper.run());
                 self.port_mappers.insert(key, mapper_tx);
+                let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapAdd successfully".into()));
             }
             Action::MapRm { lst_addr, dst_addr } => {
                 // Remove mapper from Endpoint.
                 self.port_mappers.remove(&(lst_addr, dst_addr));
+                let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapRm successfully".into()));
             }
             Action::MapLs => {
                 let mut mapls = Vec::new();
@@ -253,7 +261,13 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
         Ok(conn) => conn,
         Err(e) => {
             // This port is dead.
-            eprintln!("Failed to connect to {}: {}", addr.dst_addr, e);
+            eprintln!(
+                "{}:{} Failed to connect to {}: {}",
+                file!(),
+                line!(),
+                addr.dst_addr,
+                e
+            );
             let _ = tx
                 .send(Msg {
                     addr,
@@ -275,7 +289,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
         .await
     {
         // This port is dead.
-        eprintln!("Failed to send msg: {}", e);
+        eprintln!("{}:{} Failed to send msg: {}", file!(), line!(), e);
         return;
     }
 
@@ -288,7 +302,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                 match rh.try_read_buf(&mut read_buf) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("Failed to read from {}: {}", addr.dst_addr, e);
+                        eprintln!("{}:{} Failed to read from {}: {}", file!(), line!(), addr.dst_addr, e);
                         // This port is dead.
                         let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                         return;
@@ -296,7 +310,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                 };
                 // Send msg to peer.
                 if let Err(e) = tx.send(Msg {addr: addr.clone(), dir, typ: MsgType::MapData(read_buf)}).await {
-                    eprintln!("Failed to send msg: {}", e);
+                    eprintln!("{}:{} Failed to send msg: {}", file!(), line!(), e);
                     return;
                 }
             }
@@ -309,7 +323,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                         Ok(s) => s,
                         Err(e) => {
                             let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
-                            eprintln!("Failed to write to wh: {}", e);
+                            eprintln!("{}:{} Failed to write to wh: {}", file!(), line!(), e);
                             return;
                         }
                     };
@@ -338,12 +352,12 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                             }
                             _ => {
                                 // Unknown msg type.
-                                eprintln!("Unknown msg type");
+                                eprintln!("{}:{} Unknown msg type", file!(), line!());
                             }
                         }
                     }
                     None => {
-                        eprintln!("Failed to recv msg");
+                        eprintln!("{}:{} Failed to recv msg", file!(), line!());
                         let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                         return;
                     }
@@ -373,7 +387,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
             // Read from Hole.
             _ = readhalf.readable() => {
                 if let Err(e) = ep.msg_ctx.handle_read(&mut readhalf) {
-                    eprintln!("Failed to handle read: {}", e);
+                    eprintln!("{}:{} Failed to handle read: {}", file!(), line!(), e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -384,7 +398,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
             // Write to Hole.
             _ = writehalf.writable(), if ep.msg_ctx.need_to_write() => {
                 if let Err(e) = ep.msg_ctx.handle_write(&mut writehalf) {
-                    eprintln!("Failed to handle write: {}", e);
+                    eprintln!("{}:{} Failed to handle write: {}", file!(), line!(), e);
                     let (conn, _) = accept(&mut listener).await;
                     let (rh, wh) = conn.into_split();
                     readhalf = rh;
@@ -397,7 +411,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
                     // Handle ctl and then response.
                     ep.handle_ctl(ctl, oneshot_tx).await;
                 } else {
-                    eprintln!("ctl_rx closed");
+                    eprintln!("{}:{} ctl_rx closed", file!(), line!());
                     ctl_rx_closed = true;
                 }
             }
@@ -407,7 +421,7 @@ async fn route(addr: SocketAddr, mut ctl_rx: mpsc::Receiver<CtlChanMsg>) {
                     // This msg should send to hole
                     ep.msg_ctx.queue_tx_msg(msg);
                 } else {
-                    eprintln!("mapper_rx closed");
+                    eprintln!("{}:{} mapper_rx closed", file!(), line!());
                     mapper_rx_closed = true;
                 }
             }
@@ -441,7 +455,13 @@ impl PortMapper {
         let lst = match TcpListener::bind(&self.lst_addr).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Failed to listen on {}: {}", self.lst_addr, e);
+                eprintln!(
+                    "{}:{} Failed to listen on {}: {}",
+                    file!(),
+                    line!(),
+                    self.lst_addr,
+                    e
+                );
                 return;
             }
         };
@@ -453,7 +473,7 @@ impl PortMapper {
                     Ok(v) => v,
                     Err(e) => {
                         // If we failed to listen, this mapper is dead.
-                        eprintln!("Failed to accept {}: {}", self.lst_addr, e);
+                        eprintln!("{}:{} Failed to accept {}: {}", file!(), line!(), self.lst_addr, e);
                         return;
                     }
                 };
@@ -469,7 +489,7 @@ impl PortMapper {
                     msg
                 } else {
                     // Maybe this mapper is dead.
-                    eprintln!("Failed to recv msg for {}", self.lst_addr);
+                    eprintln!("{}:{} Failed to recv msg for {}", file!(), line!(), self.lst_addr);
                     return;
                 };
                 // Now process msg...
@@ -483,14 +503,20 @@ impl PortMapper {
         if let Some(tx) = self.ports.get_mut(&key) {
             let lst_addr = msg.addr.lst_addr.clone();
             if let Err(e) = tx.send(msg).await {
-                eprintln!("Failed to send msg to {}: {}", lst_addr, e);
+                eprintln!(
+                    "{}:{} Failed to send msg to {}: {}",
+                    file!(),
+                    line!(),
+                    lst_addr,
+                    e
+                );
                 // This port is dead.
                 self.ports.remove(&key);
             }
         } else {
             // No port match for this msg, just drop it.
             eprintln!(
-                "No port match for msg, local_addr: {}, lst_addr: {}, remap_addr: {}, dst_addr: {}",
+                "{}:{} No port match for msg, local_addr: {}, lst_addr: {}, remap_addr: {}, dst_addr: {}", file!(), line!(),
                 msg.addr.local_addr, msg.addr.lst_addr, msg.addr.remap_addr, msg.addr.dst_addr
             );
         }
@@ -529,7 +555,12 @@ async fn port(
         })
         .await
     {
-        eprintln!("Failed to send MapConnecting to peer: {}", e);
+        eprintln!(
+            "{}:{} Failed to send MapConnecting to peer: {}",
+            file!(),
+            line!(),
+            e
+        );
         // This port is dead.
         return;
     };
@@ -541,7 +572,7 @@ async fn port(
                 match rh.try_read_buf(&mut read_buf) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("Failed to read from {}: {}", local_addr, e);
+                        eprintln!("{}:{} Failed to read from {}: {}", file!(), line!(), local_addr, e);
                         // This port is dead.
                         let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                         return;
@@ -554,7 +585,7 @@ async fn port(
                 };
                 // Send msg to router.
                 if let Err(e) = tx.send(msg).await {
-                    eprintln!("Failed to send msg to route for {}: {}", lst_addr, e);
+                    eprintln!("{}:{} Failed to send msg to route for {}: {}", file!(), line!(), lst_addr, e);
                     // This port is dead.
                     return;
                 }
@@ -570,7 +601,7 @@ async fn port(
                     let s = match wh.try_write(&writing_buf_ref[written_bytes..len]) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("Failed to write to {}: {}", local_addr, e);
+                            eprintln!("{}:{} Failed to write to {}: {}", file!(), line!(), local_addr, e);
                             // This port is dead.
                             let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                             return;
@@ -593,7 +624,7 @@ async fn port(
                 let Msg {addr: _addr, dir: _, typ} = if let Some(m) = m {
                     m
                 } else {
-                    eprintln!("Failed to receive msg from router");
+                    eprintln!("{}:{} Failed to receive msg from router", file!(), line!());
                     // This port is dead.
                     let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                     return;
@@ -614,7 +645,7 @@ async fn port(
                     }
                     _ => {
                         // We can not handle this msg.
-                        eprintln!("Unknown msg type");
+                        eprintln!("{}:{} Unknown msg type", file!(), line!());
                     },
                 }
             }

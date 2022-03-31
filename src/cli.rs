@@ -42,7 +42,13 @@ pub(crate) async fn cli(arg: Cli) {
     let conn = match TcpStream::connect(arg.cli_addr).await {
         Ok(conn) => conn,
         Err(e) => {
-            eprintln!("Failed to connect to {}: {}", arg.cli_addr, e);
+            eprintln!(
+                "{}:{} Failed to connect to {}: {}",
+                file!(),
+                line!(),
+                arg.cli_addr,
+                e
+            );
             return;
         }
     };
@@ -51,14 +57,26 @@ pub(crate) async fn cli(arg: Cli) {
     let ctl = Ctl::Act(arg.action);
     // Send Ctl to endpoint
     if let Err(e) = msg_ctx.write(&mut writehalf, ctl).await {
-        eprintln!("Failed to write to {}: {}", arg.cli_addr, e);
+        eprintln!(
+            "{}:{} Failed to write to {}: {}",
+            file!(),
+            line!(),
+            arg.cli_addr,
+            e
+        );
         return;
     }
     // Wait result from endpoint
     let rsp = match msg_ctx.read(&mut readhalf).await {
         Ok(rsp) => rsp,
         Err(e) => {
-            eprintln!("Failed to read from {}: {}", arg.cli_addr, e);
+            eprintln!(
+                "{}:{} Failed to read from {}: {}",
+                file!(),
+                line!(),
+                arg.cli_addr,
+                e
+            );
             return;
         }
     };
