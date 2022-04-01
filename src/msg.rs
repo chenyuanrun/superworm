@@ -1,4 +1,4 @@
-use log::{error, trace};
+use log::{debug, error, trace};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -114,7 +114,7 @@ where
                         }
                     }
                     Err(e) => {
-                        trace!("{}:{} Failed to read: {}", file!(), line!(), e);
+                        debug!("{}:{} Failed to read: {}", file!(), line!(), e);
                         return Err(e);
                     }
                 };
@@ -159,7 +159,7 @@ where
                 }
             }
             Err(e) => {
-                trace!("{}:{} Failed to read: {}", file!(), line!(), e);
+                debug!("{}:{} Failed to read: {}", file!(), line!(), e);
                 return Err(e);
             }
         };
@@ -179,7 +179,7 @@ where
         // Deserialize.
         let res = match bincode::deserialize::<RM>(&self.read_buf[..]) {
             Ok(msg) => {
-                trace!("{}:{} deserialize msg", file!(), line!());
+                debug!("{}:{} deserialize msg", file!(), line!());
                 self.msgs_from_read.push_back(msg);
                 Ok(())
             }
@@ -196,7 +196,7 @@ where
 
     pub async fn read(&mut self, readhalf: &mut OwnedReadHalf) -> Result<RM, std::io::Error> {
         if let Some(rmsg) = self.pop_rx_msg() {
-            trace!("{}:{} return exist msg", file!(), line!());
+            debug!("{}:{} return exist msg", file!(), line!());
             return Ok(rmsg);
         }
         while !self.have_rx_msg() {
@@ -211,7 +211,7 @@ where
                 }
             }
         }
-        trace!("{}:{} Read msg successfully", file!(), line!());
+        debug!("{}:{} Read msg successfully", file!(), line!());
         // There must be msg received here.
         Ok(self.pop_rx_msg().unwrap())
     }

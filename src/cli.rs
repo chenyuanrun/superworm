@@ -1,4 +1,4 @@
-use log::{error, trace};
+use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -56,7 +56,7 @@ pub(crate) async fn cli(arg: Cli) {
     let (mut readhalf, mut writehalf) = conn.into_split();
     let mut msg_ctx = MsgCtx::<CtlRsp, Ctl>::new();
     let ctl = Ctl::Act(arg.action);
-    trace!("{}:{} Send ctl to endpoint: {:?}", file!(), line!(), ctl);
+    debug!("{}:{} Send ctl to endpoint: {:?}", file!(), line!(), ctl);
     // Send Ctl to endpoint
     if let Err(e) = msg_ctx.write(&mut writehalf, ctl).await {
         error!(
@@ -68,7 +68,7 @@ pub(crate) async fn cli(arg: Cli) {
         );
         return;
     }
-    trace!("{}:{} Waiting for ctl rsp", file!(), line!());
+    debug!("{}:{} Waiting for ctl rsp", file!(), line!());
     // Wait result from endpoint
     let rsp = match msg_ctx.read(&mut readhalf).await {
         Ok(rsp) => rsp,
@@ -83,7 +83,7 @@ pub(crate) async fn cli(arg: Cli) {
             return;
         }
     };
-    trace!("{}:{} Received ctl rsp: {:?}", file!(), line!(), rsp);
+    debug!("{}:{} Received ctl rsp: {:?}", file!(), line!(), rsp);
     // Now print the response.
     println!("{}", rsp);
 }

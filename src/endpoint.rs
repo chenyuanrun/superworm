@@ -1,6 +1,6 @@
 use crate::cli::Action;
 use crate::msg::{AddrPair, Msg, MsgCtx, MsgDirection, MsgType};
-use log::{error, trace};
+use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
@@ -59,7 +59,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
         }
     };
     let (conn, addr) = accept(&mut listener).await;
-    trace!("{}:{} Accept connection from {}", file!(), line!(), addr);
+    debug!("{}:{} Accept connection from {}", file!(), line!(), addr);
     let (mut readhalf, mut writehalf) = conn.into_split();
 
     loop {
@@ -80,7 +80,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
                 // Send Ctl to router and wait for CtlRsp
                 loop {
                     if let Some(ctl) = msg_ctx.pop_rx_msg() {
-                        trace!("{}:{} Got ctl {:?}", file!(), line!(), ctl);
+                        debug!("{}:{} Got ctl {:?}", file!(), line!(), ctl);
                         let (oneshot_tx, oneshot_rx) = oneshot::channel();
                         if let Err(e) = tx.send((ctl, oneshot_tx)).await {
                             panic!("Ctl receive closed: {}", e);
@@ -91,7 +91,7 @@ async fn handle_cli(tx: Sender<CtlChanMsg>, cli_addr: SocketAddr) {
                                 panic!("Expect a CtlRsp: {}", e);
                             }
                         };
-                        trace!("{}:{} Got ctl rsp {:?}", file!(), line!(), rsp);
+                        debug!("{}:{} Got ctl rsp {:?}", file!(), line!(), rsp);
                         msg_ctx.queue_tx_msg(rsp);
                     } else {
                         break;
@@ -170,7 +170,7 @@ impl Endpoint {
                                 {
                                     // This map is dead.
                                     self.port_mappers.remove(&key);
-                                    trace!(
+                                    debug!(
                                         "{}:{} Remove map {}<=>{}",
                                         file!(),
                                         line!(),
@@ -205,7 +205,7 @@ impl Endpoint {
                                 {
                                     // This port is dead.
                                     self.dst_ports.remove(&key);
-                                    trace!(
+                                    debug!(
                                         "{}/{} Remove map {}<=>{}<=>{}",
                                         file!(),
                                         line!(),
@@ -237,7 +237,7 @@ impl Endpoint {
     async fn handle_action(&mut self, act: Action, oneshot_tx: oneshot::Sender<CtlRsp>) {
         match act {
             Action::MapAdd { lst_addr, dst_addr } => {
-                trace!("{}:{} MapAdd {}<=>{}", file!(), line!(), lst_addr, dst_addr);
+                debug!("{}:{} MapAdd {}<=>{}", file!(), line!(), lst_addr, dst_addr);
                 let key = (lst_addr.clone(), dst_addr.clone());
                 if self.port_mappers.contains_key(&key) {
                     let _ = oneshot_tx.send(CtlRsp::Msg(
@@ -260,13 +260,13 @@ impl Endpoint {
                 let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapAdd successfully".into()));
             }
             Action::MapRm { lst_addr, dst_addr } => {
-                trace!("{}/{} MapRm {}<=>{}", file!(), line!(), lst_addr, dst_addr);
+                debug!("{}/{} MapRm {}<=>{}", file!(), line!(), lst_addr, dst_addr);
                 // Remove mapper from Endpoint.
                 self.port_mappers.remove(&(lst_addr, dst_addr));
                 let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapRm successfully".into()));
             }
             Action::MapLs => {
-                trace!("{}/{} MapLs", file!(), line!());
+                debug!("{}/{} MapLs", file!(), line!());
                 let mut mapls = Vec::new();
                 for (lst_addr, dst_addr) in self.port_mappers.keys() {
                     mapls.push((lst_addr.clone(), dst_addr.clone()));
@@ -304,7 +304,7 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
             return;
         }
     };
-    trace!(
+    debug!(
         "{}:{} Connected to dstaddr: {}->{}",
         file!(),
         line!(),
@@ -335,11 +335,12 @@ async fn dst_port(mut addr: AddrPair, tx: mpsc::Sender<Msg>, mut rx: mpsc::Recei
                 match rh.try_read_buf(&mut read_buf) {
                     Ok(s) => {
                         if s == 0 {
-                            trace!("{}/{} Read zero bytes", file!(), line!());
+                            debug!("{}:{} Read zero bytes", file!(), line!());
                             // This port is dead.
                             let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                             return;
                         }
+                        trace!("{}:{} Read {} bytes", file!(), line!(), s);
                     },
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -532,7 +533,7 @@ impl PortMapper {
                             return;
                         }
                     };
-                    trace!("{}:{} Accept connection {}", file!(), line!(), addr);
+                    debug!("{}:{} Accept connection {}", file!(), line!(), addr);
                     let key = (self.lst_addr.clone(), self.dst_addr.clone(), addr.clone());
                     // PortMapper -> Port
                     let (port_tx, port_rx) = mpsc::channel(1024);
@@ -573,7 +574,7 @@ impl PortMapper {
                     e
                 );
                 // This port is dead.
-                trace!(
+                debug!(
                     "{}/{} Remove map {}<=>{}<=>{}",
                     file!(),
                     line!(),
@@ -642,7 +643,7 @@ async fn port(
                 match rh.try_read_buf(&mut read_buf) {
                     Ok(s) => {
                         if s == 0 {
-                            trace!("{}/{} Read zero byte", file!(), line!());
+                            debug!("{}/{} Read zero byte", file!(), line!());
                             // This port is dead.
                             let _ = tx.send(Msg {addr, dir, typ: MsgType::MapDisconnect}).await;
                             return;
