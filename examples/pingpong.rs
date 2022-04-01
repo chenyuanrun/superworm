@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use log::{debug, error, info};
-use std::net::SocketAddr;
+use std::{io::Write, net::SocketAddr};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -29,6 +29,8 @@ enum Subcmd {
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
+
     match _Args::parse().subcmd {
         Subcmd::Ping { addr } => ping(addr).await,
         Subcmd::Pong { addr } => pong(addr).await,
@@ -43,10 +45,12 @@ async fn ping(addr: SocketAddr) {
             return;
         }
     };
+    info!("Connected to {}", addr);
 
     loop {
         let mut input = String::new();
         print!(":: ");
+        let _ = std::io::stdout().flush();
         match std::io::stdin().read_line(&mut input) {
             Ok(s) => {
                 debug!("Read {} byte from stdin", s);
@@ -78,6 +82,8 @@ async fn ping(addr: SocketAddr) {
                 return;
             }
         }
+        print!(">> {}", std::str::from_utf8(&buf[..]).unwrap());
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -107,6 +113,7 @@ async fn pong(addr: SocketAddr) {
                 debug!("Read {} byte from {}", s, local_addr);
                 if s == 0 {
                     info!("Peer {} closed", local_addr);
+                    return;
                 }
             }
             Err(e) => {
