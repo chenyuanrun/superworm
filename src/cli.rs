@@ -1,6 +1,6 @@
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use crate::{
     endpoint::{Ctl, CtlRsp},
@@ -36,6 +36,13 @@ pub enum Action {
     },
     #[clap(name = "mapls")]
     MapLs,
+    #[clap(name = "mapload")]
+    MapLoad {
+        #[clap(long)]
+        map_file: PathBuf,
+    },
+    #[clap(name = "mapdump")]
+    MapDump,
 }
 
 pub(crate) async fn cli(arg: Cli) {

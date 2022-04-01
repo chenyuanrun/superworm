@@ -4,6 +4,7 @@ use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
@@ -11,6 +12,11 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::{self, Sender},
 };
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MapFile {
+    maps: Vec<(SocketAddr, SocketAddr)>,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Ctl {
@@ -21,6 +27,7 @@ pub enum Ctl {
 pub enum CtlRsp {
     Msg(i32, String),
     MapLs(Vec<(SocketAddr, SocketAddr)>),
+    MapDump(Vec<(SocketAddr, SocketAddr)>),
 }
 
 impl Display for CtlRsp {
@@ -34,6 +41,13 @@ impl Display for CtlRsp {
                     write!(f, "{} => {}", lst_addr, dst_addr)?;
                 }
                 Ok(())
+            }
+            CtlRsp::MapDump(l) => {
+                write!(
+                    f,
+                    "{}",
+                    serde_json::to_string(&MapFile { maps: l.clone() }).unwrap()
+                )
             }
         }
     }
@@ -234,44 +248,98 @@ impl Endpoint {
         };
     }
 
+    fn add_map(
+        &mut self,
+        lst_addr: SocketAddr,
+        dst_addr: SocketAddr,
+    ) -> Result<(), std::io::Error> {
+        debug!("{}:{} MapAdd {}<=>{}", file!(), line!(), lst_addr, dst_addr);
+        let key = (lst_addr.clone(), dst_addr.clone());
+        if self.port_mappers.contains_key(&key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("map {}<=>{} exist", lst_addr, dst_addr),
+            ));
+        }
+        let (mapper_tx, mapper_rx) = mpsc::channel(1024);
+        let mapper = PortMapper {
+            lst_addr: lst_addr.clone(),
+            dst_addr: dst_addr.clone(),
+            mapper_rx,
+            router_tx: self.router_tx.clone(),
+            ports: HashMap::new(),
+        };
+        // Start port mapper.
+        tokio::spawn(mapper.run());
+        self.port_mappers.insert(key, mapper_tx);
+        Ok(())
+    }
+
     async fn handle_action(&mut self, act: Action, oneshot_tx: oneshot::Sender<CtlRsp>) {
         match act {
-            Action::MapAdd { lst_addr, dst_addr } => {
-                debug!("{}:{} MapAdd {}<=>{}", file!(), line!(), lst_addr, dst_addr);
-                let key = (lst_addr.clone(), dst_addr.clone());
-                if self.port_mappers.contains_key(&key) {
-                    let _ = oneshot_tx.send(CtlRsp::Msg(
-                        1,
-                        format!("map {}<=>{} exist", lst_addr, dst_addr),
-                    ));
-                    return;
+            Action::MapAdd { lst_addr, dst_addr } => match self.add_map(lst_addr, dst_addr) {
+                Ok(_) => {
+                    let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapAdd successfully".into()));
                 }
-                let (mapper_tx, mapper_rx) = mpsc::channel(1024);
-                let mapper = PortMapper {
-                    lst_addr: lst_addr.clone(),
-                    dst_addr: dst_addr.clone(),
-                    mapper_rx,
-                    router_tx: self.router_tx.clone(),
-                    ports: HashMap::new(),
-                };
-                // Start port mapper.
-                tokio::spawn(mapper.run());
-                self.port_mappers.insert(key, mapper_tx);
-                let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapAdd successfully".into()));
-            }
+                Err(e) => {
+                    let _ = oneshot_tx.send(CtlRsp::Msg(1, format!("MapAdd failed: {}", e)));
+                }
+            },
             Action::MapRm { lst_addr, dst_addr } => {
-                debug!("{}/{} MapRm {}<=>{}", file!(), line!(), lst_addr, dst_addr);
+                debug!("{}:{} MapRm {}<=>{}", file!(), line!(), lst_addr, dst_addr);
                 // Remove mapper from Endpoint.
                 self.port_mappers.remove(&(lst_addr, dst_addr));
                 let _ = oneshot_tx.send(CtlRsp::Msg(0, "MapRm successfully".into()));
             }
             Action::MapLs => {
-                debug!("{}/{} MapLs", file!(), line!());
+                debug!("{}:{} MapLs", file!(), line!());
                 let mut mapls = Vec::new();
                 for (lst_addr, dst_addr) in self.port_mappers.keys() {
                     mapls.push((lst_addr.clone(), dst_addr.clone()));
                 }
                 let _ = oneshot_tx.send(CtlRsp::MapLs(mapls));
+            }
+            Action::MapLoad { map_file } => {
+                // Open map file
+                let file = match std::fs::File::open(&map_file) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("{}:{} Failed to open file: {}", file!(), line!(), e);
+                        let _ = oneshot_tx.send(CtlRsp::Msg(1, "Failed to open file".into()));
+                        return;
+                    }
+                };
+                let reader = BufReader::new(file);
+                let map_file: MapFile = match serde_json::from_reader(reader) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("{}:{} Failed to parse map file: {}", file!(), line!(), e);
+                        let _ = oneshot_tx.send(CtlRsp::Msg(1, "Failed to parse map file".into()));
+                        return;
+                    }
+                };
+                // Add all map in map file
+                for (lst_addr, dst_addr) in map_file.maps {
+                    if let Err(e) = self.add_map(lst_addr, dst_addr) {
+                        error!(
+                            "{}:{} Map {}->{} failed: {}",
+                            file!(),
+                            line!(),
+                            lst_addr,
+                            dst_addr,
+                            e
+                        );
+                    }
+                }
+                let _ = oneshot_tx.send(CtlRsp::Msg(0, "Map file loaded!".into()));
+            }
+            Action::MapDump => {
+                debug!("{}:{} MapDump", file!(), line!());
+                let mut mapdump = Vec::new();
+                for (lst_addr, dst_addr) in self.port_mappers.keys() {
+                    mapdump.push((lst_addr.clone(), dst_addr.clone()));
+                }
+                let _ = oneshot_tx.send(CtlRsp::MapDump(mapdump));
             }
         };
     }
